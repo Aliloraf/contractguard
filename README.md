@@ -1,4 +1,4 @@
-# ContractGuard 🛡️
+# ContractGuard
 
 **Catch breaking API changes before they merge.**
 
