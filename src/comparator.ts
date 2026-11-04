@@ -1,9 +1,42 @@
 import type { ComparisonResult, Finding, JsonObject } from './types';
+import {
+  Bound,
+  Document,
+  NUMERIC_TYPES,
+  canonicalize,
+  constraintApplies,
+  countLowerBound,
+  countUpperBound,
+  documentFor,
+  effectiveTypes,
+  enumValues,
+  formatLower,
+  formatTypes,
+  formatUpper,
+  isClosedObject,
+  isTighterLower,
+  isTighterUpper,
+  numericLowerBound,
+  numericUpperBound,
+  permits,
+  record,
+  resolve,
+  strings,
+  valueKey,
+} from './schema';
+import { BranchDelta, compareBranchLists, flattenAllOf } from './composition';
 
 const METHODS = ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace'] as const;
 
-/** Schema keywords whose semantics this rule set cannot evaluate yet. */
-const COMPOSITION_KEYWORDS = ['allOf', 'oneOf', 'anyOf', 'not'] as const;
+/** Alternatives, handled by proof rather than by merging. */
+const UNION_KEYWORDS = ['anyOf', 'oneOf'] as const;
+
+/**
+ * Guards against a schema graph that defeats the cycle checks. Real documents
+ * nest nowhere near this deep, so reaching it means something is wrong and the
+ * subschema is reported as not compared instead of risking a stack overflow.
+ */
+const MAX_SCHEMA_DEPTH = 64;
 
 /**
  * Validation keywords that affect compatibility but cannot be compared
@@ -31,6 +64,10 @@ const UNCOMPARED_CONSTRAINTS = [
   'writeOnly',
   'unevaluatedProperties',
   'unevaluatedItems',
+  'not',
+  'if',
+  'then',
+  'else',
 ] as const;
 
 /**
@@ -44,204 +81,6 @@ interface Reporter {
   breaking(code: string, location: string, message: string): void;
   /** A place the rule set could not evaluate; never fails the check on its own. */
   notice(code: string, location: string, message: string): void;
-}
-
-function record(value: unknown): JsonObject {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value as JsonObject
-    : {};
-}
-
-function strings(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
-}
-
-function resolve(root: JsonObject, value: unknown): JsonObject {
-  let current = record(value);
-  const seen = new Set<string>();
-  while (typeof current.$ref === 'string') {
-    const ref = current.$ref;
-    if (!ref.startsWith('#/')) {
-      throw new Error(`Only internal OpenAPI references are supported: ${ref}`);
-    }
-    if (seen.has(ref)) {
-      throw new Error(`Cyclic $ref alias: ${ref}`);
-    }
-    seen.add(ref);
-    let target: unknown = root;
-    for (const segment of ref.slice(2).split('/')) {
-      const key = segment.replace(/~1/g, '/').replace(/~0/g, '~');
-      target = record(target)[key];
-      if (target === undefined) throw new Error(`Unresolved OpenAPI reference: ${ref}`);
-    }
-    current = record(target);
-  }
-  return current;
-}
-
-/**
- * The set of JSON types a schema permits, folding OpenAPI 3.0 `nullable: true`
- * into the 3.1 style type set so both dialects compare the same way.
- * An empty set means "unconstrained".
- *
- * Only a declared `type` constrains the instance type. Keywords such as
- * `properties` or `items` apply solely to instances that already are objects or
- * arrays, so they are never read as an implied type: a schema with `properties`
- * and no `type` still validates a string.
- */
-function effectiveTypes(schema: JsonObject): Set<string> {
-  const types = new Set<string>();
-  const declared = schema.type;
-  if (typeof declared === 'string') types.add(declared);
-  else if (Array.isArray(declared)) {
-    for (const entry of declared) if (typeof entry === 'string') types.add(entry);
-  }
-  if (types.size > 0 && schema.nullable === true) types.add('null');
-  return types;
-}
-
-/**
- * Whether a type set accepts every instance of `type`. JSON Schema defines one
- * such relation between type names: every `integer` is also a `number`.
- */
-function permits(types: Set<string>, type: string): boolean {
-  return types.has(type) || (type === 'integer' && types.has('number'));
-}
-
-function formatTypes(types: Iterable<string>): string {
-  return [...types].sort().join(' | ');
-}
-
-function valueKey(value: unknown): string {
-  return JSON.stringify(value) ?? 'undefined';
-}
-
-/** Distinct enum values keyed by their JSON form, or `null` when unconstrained. */
-function enumValues(schema: JsonObject): Map<string, unknown> | null {
-  if (!Array.isArray(schema.enum) || schema.enum.length === 0) return null;
-  const values = new Map<string, unknown>();
-  for (const value of schema.enum) values.set(valueKey(value), value);
-  return values;
-}
-
-function isClosedObject(schema: JsonObject): boolean {
-  return schema.additionalProperties === false;
-}
-
-const NUMERIC_TYPES = ['number', 'integer'] as const;
-
-/**
- * Whether a validation keyword can affect any instance either side accepts.
- * A keyword only constrains instances of the types it applies to, so comparing
- * `minLength` on a pair of schemas that are both declared `number` would be
- * noise. An undeclared type means any instance is possible, so the keyword can
- * bite; this asks what the keywords constrain and never infers a type.
- */
-function constraintApplies(
-  oldSchema: JsonObject,
-  newSchema: JsonObject,
-  applicable: readonly string[],
-): boolean {
-  const combined = new Set([...effectiveTypes(oldSchema), ...effectiveTypes(newSchema)]);
-  if (combined.size === 0) return true;
-  return applicable.some(type => combined.has(type));
-}
-
-/** One edge of a permitted range. `limit` may be infinite when absent. */
-interface Bound {
-  limit: number;
-  exclusive: boolean;
-}
-
-const LOWER_UNBOUNDED: Bound = { limit: -Infinity, exclusive: false };
-const UPPER_UNBOUNDED: Bound = { limit: Infinity, exclusive: false };
-
-function isTighterLower(next: Bound, previous: Bound): boolean {
-  if (next.limit !== previous.limit) return next.limit > previous.limit;
-  return next.exclusive && !previous.exclusive;
-}
-
-function isTighterUpper(next: Bound, previous: Bound): boolean {
-  if (next.limit !== previous.limit) return next.limit < previous.limit;
-  return next.exclusive && !previous.exclusive;
-}
-
-function formatLower(bound: Bound): string {
-  return bound.limit === -Infinity ? 'unbounded' : `${bound.exclusive ? '>' : '>='} ${bound.limit}`;
-}
-
-function formatUpper(bound: Bound): string {
-  return bound.limit === Infinity ? 'unbounded' : `${bound.exclusive ? '<' : '<='} ${bound.limit}`;
-}
-
-/** True when only integers are permitted, so exclusive bounds can be snapped. */
-function isIntegerOnly(schema: JsonObject): boolean {
-  const types = effectiveTypes(schema);
-  return types.has('integer') && !types.has('number');
-}
-
-/** `exclusiveMinimum: 4` and `minimum: 5` accept the same integers. */
-function snapLowerToInteger(bound: Bound): Bound {
-  if (!bound.exclusive || !Number.isFinite(bound.limit)) return bound;
-  return {
-    limit: Number.isInteger(bound.limit) ? bound.limit + 1 : Math.ceil(bound.limit),
-    exclusive: false,
-  };
-}
-
-function snapUpperToInteger(bound: Bound): Bound {
-  if (!bound.exclusive || !Number.isFinite(bound.limit)) return bound;
-  return {
-    limit: Number.isInteger(bound.limit) ? bound.limit - 1 : Math.floor(bound.limit),
-    exclusive: false,
-  };
-}
-
-/**
- * The effective lower bound, accepting both dialects: OpenAPI 3.0 writes
- * `minimum` with a boolean `exclusiveMinimum`, OpenAPI 3.1 writes a numeric
- * `exclusiveMinimum`. When both appear the stricter one wins.
- */
-function numericLowerBound(schema: JsonObject): Bound {
-  let bound = LOWER_UNBOUNDED;
-  const minimum = schema.minimum;
-  const exclusive = schema.exclusiveMinimum;
-  if (typeof minimum === 'number') {
-    const candidate: Bound = { limit: minimum, exclusive: exclusive === true };
-    if (isTighterLower(candidate, bound)) bound = candidate;
-  }
-  if (typeof exclusive === 'number') {
-    const candidate: Bound = { limit: exclusive, exclusive: true };
-    if (isTighterLower(candidate, bound)) bound = candidate;
-  }
-  return isIntegerOnly(schema) ? snapLowerToInteger(bound) : bound;
-}
-
-function numericUpperBound(schema: JsonObject): Bound {
-  let bound = UPPER_UNBOUNDED;
-  const maximum = schema.maximum;
-  const exclusive = schema.exclusiveMaximum;
-  if (typeof maximum === 'number') {
-    const candidate: Bound = { limit: maximum, exclusive: exclusive === true };
-    if (isTighterUpper(candidate, bound)) bound = candidate;
-  }
-  if (typeof exclusive === 'number') {
-    const candidate: Bound = { limit: exclusive, exclusive: true };
-    if (isTighterUpper(candidate, bound)) bound = candidate;
-  }
-  return isIntegerOnly(schema) ? snapUpperToInteger(bound) : bound;
-}
-
-/** An absent `minLength`/`minItems` is the same as zero. */
-function countLowerBound(schema: JsonObject, keyword: string): Bound {
-  const value = schema[keyword];
-  return { limit: typeof value === 'number' ? value : 0, exclusive: false };
-}
-
-/** An absent `maxLength`/`maxItems` imposes no upper limit. */
-function countUpperBound(schema: JsonObject, keyword: string): Bound {
-  const value = schema[keyword];
-  return { limit: typeof value === 'number' ? value : Infinity, exclusive: false };
 }
 
 const RANGE_RULES = {
@@ -399,6 +238,63 @@ function compareEnums(
   }
 }
 
+function unionNotice(keyword: string, delta: BranchDelta, direction: Direction): string {
+  if (delta === 'indeterminate') {
+    return `\`${keyword}\` alternatives were too large to compare; review this subschema manually.`;
+  }
+  const change = delta === 'added' ? 'were added'
+    : delta === 'removed' ? 'were removed'
+      : 'were both added and removed';
+  if (keyword === 'oneOf') {
+    return `\`oneOf\` alternatives ${change}; because exactly one alternative must match, overlapping alternatives can invalidate instances that were valid before. Review this subschema manually.`;
+  }
+  if (delta === 'added') {
+    return `\`anyOf\` alternatives ${change}; a response may now return instances matching the new alternative unless it was already covered. Review this subschema manually.`;
+  }
+  if (delta === 'removed') {
+    return `\`anyOf\` alternatives ${change}; a remaining alternative may still accept the same instances, so whether anything is now rejected cannot be established. Review this subschema manually.`;
+  }
+  return `\`anyOf\` alternatives ${change}; review this subschema manually.`;
+}
+
+/**
+ * Alternatives are compared as whole lists, never branch against branch: pairing
+ * them up would invent a correspondence the schema does not have.
+ *
+ * Two cases are provable and stay silent. Adding an `anyOf` alternative cannot
+ * reject a request that was accepted before, because every former alternative
+ * is still there; removing one cannot give a response client a value it could
+ * not already receive. Everything else, including every `oneOf` change, depends
+ * on whether alternatives overlap and is reported for review.
+ */
+function compareUnions(
+  before: Document,
+  after: Document,
+  oldSchema: JsonObject,
+  newSchema: JsonObject,
+  location: string,
+  direction: Direction,
+  report: Reporter,
+): void {
+  for (const keyword of UNION_KEYWORDS) {
+    const oldBranches = oldSchema[keyword];
+    const newBranches = newSchema[keyword];
+    const oldDeclared = Array.isArray(oldBranches);
+    const newDeclared = Array.isArray(newBranches);
+    if (!oldDeclared && !newDeclared) continue;
+    if (oldDeclared !== newDeclared) {
+      report.notice('UNSUPPORTED_COMPOSITION', location,
+        `\`${keyword}\` was ${oldDeclared ? 'removed' : 'added'}; whether the same instances are still accepted cannot be established. Review this subschema manually.`);
+      continue;
+    }
+    const delta = compareBranchLists(before, oldBranches as unknown[], after, newBranches as unknown[]);
+    if (delta === 'unchanged') continue;
+    if (keyword === 'anyOf' && direction === 'request' && delta === 'added') continue;
+    if (keyword === 'anyOf' && direction === 'response' && delta === 'removed') continue;
+    report.notice('UNSUPPORTED_COMPOSITION', location, unionNotice(keyword, delta, direction));
+  }
+}
+
 /** Flags keywords that are present but not evaluated, so reports stay honest. */
 function noteUnevaluatedKeywords(
   oldSchema: JsonObject,
@@ -406,12 +302,6 @@ function noteUnevaluatedKeywords(
   location: string,
   report: Reporter,
 ): void {
-  for (const keyword of COMPOSITION_KEYWORDS) {
-    if (keyword in oldSchema || keyword in newSchema) {
-      report.notice('UNSUPPORTED_COMPOSITION', location,
-        `\`${keyword}\` is present but not evaluated; review this subschema manually.`);
-    }
-  }
   if ('prefixItems' in oldSchema || 'prefixItems' in newSchema) {
     report.notice('UNSUPPORTED_TUPLE_ITEMS', location,
       'Tuple validation (`prefixItems`) is not evaluated; review positional array changes manually.');
@@ -453,25 +343,61 @@ function noteChangedConstraints(
   }
 }
 
+/** True when both schemas mean the same thing once references are expanded. */
+function sameMeaning(
+  before: Document,
+  oldSchema: JsonObject,
+  after: Document,
+  newSchema: JsonObject,
+): boolean {
+  const left = canonicalize(before, oldSchema);
+  const right = canonicalize(after, newSchema);
+  return left !== null && right !== null && left === right;
+}
+
 function compareSchema(
-  oldRoot: JsonObject,
-  newRoot: JsonObject,
+  before: Document,
+  after: Document,
   oldRaw: unknown,
   newRaw: unknown,
   location: string,
   direction: Direction,
   report: Reporter,
   seen: WeakMap<object, WeakSet<object>>,
+  depth: number,
 ): void {
-  const oldSchema = resolve(oldRoot, oldRaw);
-  const newSchema = resolve(newRoot, newRaw);
-  const visited = seen.get(oldSchema);
-  if (visited?.has(newSchema)) return;
-  if (visited) visited.add(newSchema);
-  else seen.set(oldSchema, new WeakSet([newSchema]));
+  const oldResolved = resolve(before.root, oldRaw);
+  const newResolved = resolve(after.root, newRaw);
+  const visited = seen.get(oldResolved);
+  if (visited?.has(newResolved)) return;
+  if (visited) visited.add(newResolved);
+  else seen.set(oldResolved, new WeakSet([newResolved]));
+
+  if (depth > MAX_SCHEMA_DEPTH) {
+    report.notice('SCHEMA_NOT_COMPARED', location,
+      `Schema nesting passed ${MAX_SCHEMA_DEPTH} levels; this subschema was not compared.`);
+    return;
+  }
+
+  // `allOf` is merged into an effective schema first, so every rule below sees
+  // the constraints of all branches at once.
+  const oldFlat = flattenAllOf(before, oldResolved);
+  const newFlat = flattenAllOf(after, newResolved);
+  if (!oldFlat.exact || !newFlat.exact) {
+    // An unmergeable composition that did not change needs no review.
+    if (!sameMeaning(before, oldResolved, after, newResolved)) {
+      const reason = (oldFlat.exact ? newFlat.reason : oldFlat.reason) ?? 'unsupported composition';
+      report.notice('UNSUPPORTED_COMPOSITION', location,
+        `Composed schema could not be merged without changing its meaning (${reason}); review this subschema manually.`);
+    }
+    return;
+  }
+  const oldSchema = oldFlat.schema;
+  const newSchema = newFlat.schema;
 
   noteUnevaluatedKeywords(oldSchema, newSchema, location, report);
   noteChangedConstraints(oldSchema, newSchema, location, report);
+  compareUnions(before, after, oldSchema, newSchema, location, direction, report);
   compareTypes(oldSchema, newSchema, location, direction, report);
   compareEnums(oldSchema, newSchema, location, direction, report);
   compareConstraints(oldSchema, newSchema, location, direction, report);
@@ -509,14 +435,15 @@ function compareSchema(
 
   for (const name of Object.keys(oldProperties)) {
     if (name in newProperties) {
-      compareSchema(oldRoot, newRoot, oldProperties[name], newProperties[name], `${location}.${name}`, direction, report, seen);
+      compareSchema(before, after, oldProperties[name], newProperties[name],
+        `${location}.${name}`, direction, report, seen, depth + 1);
     }
   }
 
   const oldItems = oldSchema.items;
   const newItems = newSchema.items;
   if (oldItems !== undefined && newItems !== undefined) {
-    compareSchema(oldRoot, newRoot, oldItems, newItems, `${location}[]`, direction, report, seen);
+    compareSchema(before, after, oldItems, newItems, `${location}[]`, direction, report, seen, depth + 1);
   } else if (oldItems !== undefined || newItems !== undefined) {
     report.notice('SCHEMA_NOT_COMPARED', `${location}[]`,
       `Array item schema is declared on only the ${oldItems !== undefined ? 'base' : 'head'} side; element compatibility was not evaluated.`);
@@ -524,8 +451,8 @@ function compareSchema(
 }
 
 function compareContent(
-  oldRoot: JsonObject,
-  newRoot: JsonObject,
+  before: Document,
+  after: Document,
   oldContent: unknown,
   newContent: unknown,
   location: string,
@@ -543,7 +470,7 @@ function compareContent(
     const oldSchema = record(rawOld).schema;
     const newSchema = record(newTypes[mediaType]).schema;
     if (oldSchema !== undefined && newSchema !== undefined) {
-      compareSchema(oldRoot, newRoot, oldSchema, newSchema, where, direction, report, new WeakMap());
+      compareSchema(before, after, oldSchema, newSchema, where, direction, report, new WeakMap(), 0);
     } else if (oldSchema !== undefined || newSchema !== undefined) {
       report.notice('SCHEMA_NOT_COMPARED', where,
         `A schema is declared on only the ${oldSchema !== undefined ? 'base' : 'head'} side of this media type; payload compatibility was not evaluated.`);
@@ -580,8 +507,8 @@ function effectiveSecurity(root: JsonObject, operation: JsonObject): string {
 }
 
 function compareParameters(
-  oldRoot: JsonObject,
-  newRoot: JsonObject,
+  before: Document,
+  after: Document,
   oldParameters: Map<string, JsonObject>,
   newParameters: Map<string, JsonObject>,
   where: string,
@@ -601,7 +528,7 @@ function compareParameters(
     }
     const location = `${where} ${key}`;
     if (previous.schema !== undefined && next.schema !== undefined) {
-      compareSchema(oldRoot, newRoot, previous.schema, next.schema, location, 'request', report, new WeakMap());
+      compareSchema(before, after, previous.schema, next.schema, location, 'request', report, new WeakMap(), 0);
     } else if (previous.schema !== undefined || next.schema !== undefined) {
       report.notice('SCHEMA_NOT_COMPARED', location,
         `A schema is declared on only the ${previous.schema !== undefined ? 'base' : 'head'} side of this parameter; value compatibility was not evaluated.`);
@@ -614,6 +541,8 @@ function compareParameters(
 }
 
 export function compareSpecifications(oldRoot: JsonObject, newRoot: JsonObject): ComparisonResult {
+  const before = documentFor(oldRoot);
+  const after = documentFor(newRoot);
   const breaking: Finding[] = [];
   const notices: Finding[] = [];
   const seenFindings = new Set<string>();
@@ -650,8 +579,8 @@ export function compareSpecifications(oldRoot: JsonObject, newRoot: JsonObject):
       }
 
       compareParameters(
-        oldRoot,
-        newRoot,
+        before,
+        after,
         parameterMap(oldRoot, oldPath, oldOp),
         parameterMap(newRoot, newPath, newOp),
         where,
@@ -663,7 +592,7 @@ export function compareSpecifications(oldRoot: JsonObject, newRoot: JsonObject):
       if (newBody.required === true && oldBody.required !== true) {
         report.breaking('REQUEST_BODY_REQUIRED', where, 'Request body is now required.');
       }
-      compareContent(oldRoot, newRoot, oldBody.content, newBody.content, `${where} request`, 'request', report);
+      compareContent(before, after, oldBody.content, newBody.content, `${where} request`, 'request', report);
 
       const oldResponses = record(oldOp.responses);
       const newResponses = record(newOp.responses);
@@ -673,9 +602,9 @@ export function compareSpecifications(oldRoot: JsonObject, newRoot: JsonObject):
           report.breaking('SUCCESS_RESPONSE_REMOVED', `${where} ${status}`, 'Previously documented success status removed.');
           continue;
         }
-        const before = resolve(oldRoot, oldResponse);
-        const after = resolve(newRoot, newResponses[status]);
-        compareContent(oldRoot, newRoot, before.content, after.content, `${where} ${status} response`, 'response', report);
+        const previous = resolve(oldRoot, oldResponse);
+        const next = resolve(newRoot, newResponses[status]);
+        compareContent(before, after, previous.content, next.content, `${where} ${status} response`, 'response', report);
       }
     }
   }

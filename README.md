@@ -86,6 +86,72 @@ Schema handling details:
 - **Recursive (self-referencing) schemas** terminate via pair-wise cycle tracking.
 - YAML and JSON specs are both accepted, with duplicate-key detection in YAML.
 
+## Composed schemas (`allOf`, `anyOf`, `oneOf`)
+
+Every finding falls into one of three outcomes, and composition is where the third one
+earns its keep: a change is reported as **breaking**, left silent because it is **provably
+compatible**, or raised as an **inconclusive** notice. A composed schema is never silently
+assumed to be compatible.
+
+### `allOf` is merged when the merge is provably lossless
+
+`allOf` is an intersection of constraints, not inheritance: each branch applies to the whole
+instance independently. ContractGuard merges the branches (and the enclosing schema, which
+also constrains the instance) into one effective schema and then applies every ordinary rule
+to it, so composed schemas get the same type, enum, constraint, property and `$ref` analysis
+as flat ones. The merge intersects keyword by keyword:
+
+| Keyword | Merged as |
+| --- | --- |
+| `required` | union of all branches |
+| `type` | intersection of the type sets, honouring `integer` ⊂ `number` |
+| `enum` | intersection of the value sets |
+| `minimum`/`maximum`/`exclusive*`, `min`/`maxLength`, `min`/`maxItems`, `min`/`maxProperties` | the strictest bound from any branch |
+| `properties`, `items` | per name; a name declared by several branches becomes an `allOf` of those subschemas, which is merged in turn |
+| anything else (`pattern`, `format`, `oneOf`, …) | carried over when exactly one branch declares it |
+
+Because the merge is order-insensitive, reordering branches is recognised as no change, and
+nested `allOf` is collapsed first. Branch `$ref`s are resolved against their own document.
+
+The merge is **abandoned** — raising `UNSUPPORTED_COMPOSITION` rather than a guess — when it
+would alter what the schema accepts:
+
+- **`additionalProperties` that does not govern every declared property.** This is the trap
+  that makes naive flattening wrong: `allOf: [{properties: {a}}, {additionalProperties: false}]`
+  rejects *every* object, because the closing branch declares no properties of its own, while
+  a flattened `{properties: {a}, additionalProperties: false}` would accept `{a: 1}`. Merging
+  is only allowed when every property name declared anywhere also appears in each branch that
+  closes the object, which is exactly when moving the keyword changes nothing.
+- Branch `type` sets or `enum` sets that do not intersect.
+- Two branches declaring the same keyword differently (`pattern`, `multipleOf`, `oneOf`, …),
+  since the intersection of two such constraints is not expressible as one schema.
+- `additionalProperties` combined with `patternProperties` or `unevaluatedProperties`.
+- A branch `$ref` that cannot be resolved, or a composition that references itself.
+
+Branch `description`, `title`, `example` and other annotations never block a merge.
+
+### `anyOf` and `oneOf` are compared by proof, never branch against branch
+
+Alternatives are compared as whole lists — as multisets of fully resolved schemas, so
+reordering them, or renaming a `$ref` that reaches an unchanged alternative, is recognised as
+no change. Pairing alternatives up and aggregating per-branch results would invent a
+correspondence the schema does not have, so it is not done.
+
+Only these cases are provable, and only they stay silent:
+
+| Case | Outcome |
+| --- | --- |
+| Alternatives unchanged (any order) | compatible |
+| `anyOf` alternative **added**, request | compatible — every former alternative is still present, so nothing that was accepted is now rejected |
+| `anyOf` alternative **removed**, response | compatible — the union of returned instances only shrank |
+
+Everything else is inconclusive and raises a notice, including: an `anyOf` alternative
+removed from a request (a remaining alternative may still accept the same instances), an
+`anyOf` alternative added to a response (it may widen what clients receive, unless it was
+already covered), **every** `oneOf` change (because "exactly one must match" means an added
+alternative can invalidate instances that were valid before, whenever alternatives overlap),
+and a union added or removed on one side only.
+
 ## Review-required notices
 
 Silently skipping a construct the engine cannot evaluate would make a clean report
@@ -94,7 +160,7 @@ check and **do not** change the CLI exit code; they tell you where a human still
 
 | Notice code | Meaning |
 | --- | --- |
-| `UNSUPPORTED_COMPOSITION` | `allOf`, `oneOf`, `anyOf` or `not` is present at a compared position and is not evaluated. |
+| `UNSUPPORTED_COMPOSITION` | A composed schema could not be analysed: an `allOf` that cannot be merged without changing its meaning, or an `anyOf`/`oneOf` change whose effect depends on whether alternatives overlap. The message names the reason. |
 | `UNSUPPORTED_TUPLE_ITEMS` | `prefixItems` (3.1 tuple validation) is present and is not evaluated. |
 | `SCHEMA_NOT_COMPARED` | One side of a pair declares a schema and the other does not (media type, array `items`, parameter), or a parameter uses `content` serialisation. |
 | `SECURITY_NOT_COMPARED` | The operation's effective `security` requirements changed; authentication compatibility is not analysed. |
@@ -104,9 +170,15 @@ check and **do not** change the CLI exit code; they tell you where a human still
 
 - **External or multi-file `$ref`** — any `$ref` that does not start with `#/` is rejected
   with an error (deliberate: it avoids network fetches on untrusted input).
-- **`allOf` / `oneOf` / `anyOf` / `not` / `discriminator` semantics** — composition is not
-  merged or evaluated. Its presence raises `UNSUPPORTED_COMPOSITION` rather than being
-  ignored, but changes *inside* a composed subschema are not compared.
+- **`anyOf` / `oneOf` subsumption** — no overlap or containment analysis is attempted
+  between alternatives, so only the provable cases above produce a verdict and every other
+  change is a notice. Changes *inside* an alternative are never compared branch by branch.
+- **`not` / `if` / `then` / `else` / `discriminator`** — not evaluated; a change raises
+  `CONSTRAINT_NOT_COMPARED`.
+- **Unmergeable `allOf`** — when a merge is abandoned, the subschema is not compared at all
+  (not even its enclosing keywords), and the notice says why.
+- **Schema nesting past 64 levels** is reported as not compared, as a guard against a schema
+  graph that defeats the cycle checks.
 - **`prefixItems` / tuple validation** — flagged via `UNSUPPORTED_TUPLE_ITEMS`, not compared.
 - **`security` scheme semantics** — a change is flagged via `SECURITY_NOT_COMPARED`, but
   scopes and scheme types are not analysed.
@@ -258,9 +330,10 @@ job summary and fails the check, and commenting is skipped with a warning.
 ## Roadmap
 
 1. **v0.1** — comparison engine, CLI, bundled GitHub Action, unit tests *(done)*.
-2. **v0.2** — directional type/enum rules, `additionalProperties` and array/nested coverage,
-   explicit review-required notices *(current)*; still to come: `allOf`/`oneOf`/`anyOf`
-   evaluation, numeric/string constraints, broader third-party fixtures.
+2. **v0.2** — directional type/enum rules, numeric/string/array/object constraints, safe
+   `allOf` merging, provable `anyOf`/`oneOf` cases, explicit review-required notices
+   *(current)*; still to come: `anyOf`/`oneOf` subsumption analysis, broader third-party
+   fixtures.
 3. **v0.3** — inline PR annotations, ignore/config rules, JSON diff export, multi-file `$ref`.
 4. **v1.0** — full compatibility suite, published versioned Action, example repositories.
 

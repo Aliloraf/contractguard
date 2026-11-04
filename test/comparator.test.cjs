@@ -270,10 +270,24 @@ test('a parameter switching to content serialisation is reported as not evaluate
 
 // --- Unevaluated keywords and $ref ------------------------------------------
 
-test('composition keywords are flagged instead of silently ignored', () => {
+test('a composed schema is merged and compared rather than waved through', () => {
   const before = base(), after = base();
   responseSchema(before).properties.id = { allOf: [{ type: 'string' }] };
   responseSchema(after).properties.id = { allOf: [{ type: 'integer' }] };
+  const result = compareSpecifications(before, after);
+  assert.deepEqual(result.breaking.map(f => f.code), ['SCHEMA_TYPE_CHANGED']);
+  assert.ok(result.breaking[0].location.endsWith('.id'));
+  assert.deepEqual(result.notices, [], 'a merge that preserves meaning needs no review notice');
+});
+
+test('a composition that cannot be merged safely is flagged, not ignored', () => {
+  const before = base(), after = base();
+  responseSchema(before).properties.id = {
+    allOf: [{ properties: { a: { type: 'string' } } }, { additionalProperties: false }],
+  };
+  responseSchema(after).properties.id = {
+    allOf: [{ properties: { a: { type: 'integer' } } }, { additionalProperties: false }],
+  };
   const result = compareSpecifications(before, after);
   assert.deepEqual(result.breaking, []);
   assert.ok(result.notices.some(f => f.code === 'UNSUPPORTED_COMPOSITION' && f.location.endsWith('.id')));
@@ -334,8 +348,12 @@ test('recursive $ref schemas terminate and still report breaking changes', () =>
 
 test('notices are rendered without turning a clean report into a failure', () => {
   const before = base(), after = base();
-  responseSchema(before).properties.id = { allOf: [{ type: 'string' }] };
-  responseSchema(after).properties.id = { allOf: [{ type: 'integer' }] };
+  responseSchema(before).properties.id = {
+    allOf: [{ properties: { a: { type: 'string' } } }, { additionalProperties: false }],
+  };
+  responseSchema(after).properties.id = {
+    allOf: [{ properties: { a: { type: 'integer' } } }, { additionalProperties: false }],
+  };
   const result = compareSpecifications(before, after);
   const markdown = renderMarkdown(result);
   assert.match(markdown, /No breaking changes detected/);
@@ -888,4 +906,508 @@ test('a 3.1 document migrating to the 3.0 boolean form reports nothing', () => {
   Object.assign(responseSchema(before).properties.id, { type: 'number', exclusiveMaximum: 10 });
   Object.assign(responseSchema(after).properties.id, { type: 'number', maximum: 10, exclusiveMaximum: true });
   assert.deepEqual(compareSpecifications(before, after).breaking, []);
+});
+
+// ===========================================================================
+// Schema composition: allOf, anyOf, oneOf
+// ===========================================================================
+
+function composedRequest(schema) {
+  const spec = base();
+  spec.paths['/users'].post.requestBody.content['application/json'].schema = schema;
+  return spec;
+}
+
+function composedResponse(schema) {
+  const spec = base();
+  spec.paths['/users'].get.responses['200'].content['application/json'].schema = schema;
+  return spec;
+}
+
+function requestComposition(before, after) {
+  return compareSpecifications(composedRequest(before), composedRequest(after));
+}
+
+function responseComposition(before, after) {
+  return compareSpecifications(composedResponse(before), composedResponse(after));
+}
+
+const requestCodes = (before, after) => requestComposition(before, after).breaking.map(f => f.code);
+const responseCodes = (before, after) => responseComposition(before, after).breaking.map(f => f.code);
+
+// --- allOf: properties and required across branches -------------------------
+
+test('allOf merges required fields from every branch', () => {
+  const found = requestComposition(
+    { allOf: [{ type: 'object', properties: { a: { type: 'string' } } }, { properties: { b: { type: 'string' } } }] },
+    { allOf: [{ type: 'object', properties: { a: { type: 'string' } }, required: ['a'] }, { properties: { b: { type: 'string' } }, required: ['b'] }] },
+  );
+  assert.deepEqual(found.breaking.map(f => f.code), ['REQUEST_FIELD_REQUIRED', 'REQUEST_FIELD_REQUIRED']);
+  assert.deepEqual(found.breaking.map(f => f.location.split('].').pop()).sort(), ['a', 'b']);
+  assert.deepEqual(found.notices, []);
+});
+
+test('a response field removed from one allOf branch is detected', () => {
+  const found = responseComposition(
+    { allOf: [{ type: 'object', properties: { a: { type: 'string' } } }, { properties: { b: { type: 'string' } } }] },
+    { allOf: [{ type: 'object', properties: { a: { type: 'string' } } }, { properties: {} }] },
+  );
+  assert.deepEqual(found.breaking.map(f => f.code), ['RESPONSE_FIELD_REMOVED']);
+  assert.ok(found.breaking[0].location.endsWith('.b'));
+});
+
+test('a property declared in two branches is intersected, not overwritten', () => {
+  const found = requestComposition(
+    { allOf: [{ properties: { a: { type: 'string', minLength: 1 } } }, { properties: { a: { maxLength: 10 } } }] },
+    { allOf: [{ properties: { a: { type: 'string', minLength: 5 } } }, { properties: { a: { maxLength: 10 } } }] },
+  );
+  assert.deepEqual(found.breaking.map(f => f.code), ['REQUEST_LENGTH_NARROWED']);
+  assert.ok(/Minimum length tightened/.test(found.breaking[0].message));
+});
+
+test('adding an optional property to an allOf branch stays compatible', () => {
+  const found = requestComposition(
+    { allOf: [{ type: 'object', properties: { a: { type: 'string' } } }] },
+    { allOf: [{ type: 'object', properties: { a: { type: 'string' }, b: { type: 'string' } } }] },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.deepEqual(found.notices, []);
+});
+
+// --- allOf: constraints, types and enums ------------------------------------
+
+test('allOf takes the strictest numeric bound from any branch', () => {
+  const tightened = requestComposition(
+    { allOf: [{ type: 'integer', minimum: 0 }, { maximum: 100 }] },
+    { allOf: [{ type: 'integer', minimum: 0 }, { maximum: 50 }] },
+  );
+  assert.deepEqual(tightened.breaking.map(f => f.code), ['REQUEST_RANGE_NARROWED']);
+
+  const alreadyStricter = requestComposition(
+    { allOf: [{ type: 'integer', maximum: 50 }, { maximum: 100 }] },
+    { allOf: [{ type: 'integer', maximum: 50 }, { maximum: 80 }] },
+  );
+  assert.deepEqual(alreadyStricter.breaking, [], 'relaxing a bound that was not the strictest changes nothing');
+});
+
+test('allOf applies the merged type when snapping integer bounds', () => {
+  const found = requestComposition(
+    { allOf: [{ type: 'integer' }, { minimum: 5 }] },
+    { allOf: [{ type: 'integer' }, { exclusiveMinimum: 4 }] },
+  );
+  assert.deepEqual(found.breaking, [], 'an exclusive bound in one branch is equivalent on an integer schema');
+});
+
+test('allOf intersects types across branches', () => {
+  const found = requestComposition(
+    { allOf: [{ type: ['string', 'integer'] }, { type: ['string', 'number'] }] },
+    { allOf: [{ type: ['string', 'integer'] }, { type: ['integer'] }] },
+  );
+  assert.deepEqual(found.breaking.map(f => f.code), ['SCHEMA_TYPE_CHANGED']);
+  assert.ok(/no longer accepts string/.test(found.breaking[0].message));
+});
+
+test('allOf with non-intersecting types is reported as unmergeable', () => {
+  const found = requestComposition(
+    { allOf: [{ type: 'string' }, { minLength: 1 }] },
+    { allOf: [{ type: 'string' }, { type: 'integer' }] },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.ok(found.notices.some(f =>
+    f.code === 'UNSUPPORTED_COMPOSITION' && /do not intersect/.test(f.message)));
+});
+
+test('allOf intersects enums across branches', () => {
+  const found = requestComposition(
+    { allOf: [{ enum: ['a', 'b', 'c'] }, { enum: ['a', 'b'] }] },
+    { allOf: [{ enum: ['a', 'b', 'c'] }, { enum: ['a'] }] },
+  );
+  assert.deepEqual(found.breaking.map(f => f.code), ['REQUEST_ENUM_NARROWED']);
+  assert.ok(/"b"/.test(found.breaking[0].message));
+});
+
+test('a response enum widened inside an allOf branch is detected', () => {
+  const found = responseComposition(
+    { allOf: [{ type: 'string', enum: ['open'] }] },
+    { allOf: [{ type: 'string', enum: ['open', 'merged'] }] },
+  );
+  assert.deepEqual(found.breaking.map(f => f.code), ['RESPONSE_ENUM_EXPANDED']);
+});
+
+// --- allOf: order independence ----------------------------------------------
+
+test('reordering allOf branches is not a change', () => {
+  const left = { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] };
+  const right = { properties: { b: { type: 'integer', minimum: 2 } } };
+  const found = requestComposition({ allOf: [left, right] }, { allOf: [right, left] });
+  assert.deepEqual(found.breaking, []);
+  assert.deepEqual(found.notices, []);
+});
+
+test('nested allOf is collapsed before comparing', () => {
+  const found = requestComposition(
+    { allOf: [{ allOf: [{ type: 'object', properties: { a: { type: 'string' } } }] }, { required: ['a'] }] },
+    { allOf: [{ type: 'object', properties: { a: { type: 'string' } }, required: ['a'] }] },
+  );
+  assert.deepEqual(found.breaking, [], 'the two spellings describe the same schema');
+  assert.deepEqual(found.notices, []);
+});
+
+test('composition on one side only is still compared when the merge is exact', () => {
+  const found = responseComposition(
+    { type: 'object', properties: { a: { type: 'string' } } },
+    { allOf: [{ type: 'object' }, { properties: {} }] },
+  );
+  assert.deepEqual(found.breaking.map(f => f.code), ['RESPONSE_FIELD_REMOVED']);
+});
+
+// --- allOf: the additionalProperties trap -----------------------------------
+
+test('additionalProperties: false beside the properties it governs merges safely', () => {
+  const found = requestComposition(
+    { allOf: [{ type: 'object', properties: { a: { type: 'string' }, b: { type: 'string' } }, additionalProperties: false }] },
+    { allOf: [{ type: 'object', properties: { a: { type: 'string' } }, additionalProperties: false }] },
+  );
+  assert.deepEqual(found.breaking.map(f => f.code), ['REQUEST_FIELD_REMOVED']);
+  assert.deepEqual(found.notices, []);
+});
+
+test('additionalProperties: false in a different branch is never flattened', () => {
+  const found = requestComposition(
+    { allOf: [{ properties: { a: { type: 'string' } } }, { additionalProperties: false }] },
+    { allOf: [{ properties: { a: { type: 'integer' } } }, { additionalProperties: false }] },
+  );
+  assert.deepEqual(found.breaking, [], 'merging here would wrongly accept the declared property');
+  assert.ok(found.notices.some(f =>
+    f.code === 'UNSUPPORTED_COMPOSITION' && /would reject properties declared in another/.test(f.message)));
+});
+
+test('a closing branch that covers every declared property merges safely', () => {
+  const found = requestComposition(
+    { allOf: [{ properties: { a: { type: 'string' }, b: {} }, additionalProperties: false }, { properties: { b: { type: 'string' } } }] },
+    { allOf: [{ properties: { a: { type: 'string' }, b: {} }, additionalProperties: false }, { properties: { b: { type: 'integer' } } }] },
+  );
+  assert.deepEqual(found.breaking.map(f => f.code), ['SCHEMA_TYPE_CHANGED']);
+  assert.ok(found.breaking[0].location.endsWith('.b'));
+});
+
+test('closing an allOf object that was open is breaking for requests', () => {
+  const found = requestComposition(
+    { allOf: [{ type: 'object', properties: { a: { type: 'string' } } }] },
+    { allOf: [{ type: 'object', properties: { a: { type: 'string' } }, additionalProperties: false }] },
+  );
+  assert.deepEqual(found.breaking.map(f => f.code), ['REQUEST_OBJECT_CLOSED']);
+});
+
+test('branches declaring different additionalProperties schemas are unmergeable', () => {
+  const found = requestComposition(
+    { allOf: [{ additionalProperties: { type: 'string' } }, { additionalProperties: { type: 'string' } }] },
+    { allOf: [{ additionalProperties: { type: 'string' } }, { additionalProperties: { type: 'integer' } }] },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.ok(found.notices.some(f => f.code === 'UNSUPPORTED_COMPOSITION'));
+});
+
+// --- allOf: internal references ---------------------------------------------
+
+test('allOf branches given as $ref are resolved and merged', () => {
+  const before = {
+    openapi: '3.0.3',
+    components: { schemas: {
+      Timestamps: { type: 'object', properties: { createdAt: { type: 'string' } }, required: ['createdAt'] },
+      User: { allOf: [{ $ref: '#/components/schemas/Timestamps' }, { properties: { name: { type: 'string' } } }] },
+    } },
+    paths: { '/users': { get: { responses: { '200': { content: { 'application/json': {
+      schema: { $ref: '#/components/schemas/User' },
+    } } } } } } },
+  };
+  const after = structuredClone(before);
+  after.components.schemas.Timestamps.required = [];
+  const result = compareSpecifications(before, after);
+  assert.deepEqual(result.breaking.map(f => f.code), ['RESPONSE_FIELD_OPTIONAL']);
+  assert.ok(result.breaking[0].location.endsWith('.createdAt'));
+});
+
+test('a referenced branch that changes a nested array element is detected', () => {
+  const before = {
+    openapi: '3.1.0',
+    components: { schemas: { Line: { type: 'object', properties: { price: { type: 'number', maximum: 10 } } } } },
+    paths: { '/orders': { get: { responses: { '200': { content: { 'application/json': { schema: {
+      allOf: [
+        { type: 'object', properties: { lines: { type: 'array', items: { $ref: '#/components/schemas/Line' } } } },
+        { required: ['lines'] },
+      ],
+    } } } } } } } },
+  };
+  const after = structuredClone(before);
+  after.components.schemas.Line.properties.price.maximum = 100;
+  const result = compareSpecifications(before, after);
+  assert.deepEqual(result.breaking.map(f => f.code), ['RESPONSE_RANGE_WIDENED']);
+  assert.ok(result.breaking[0].location.endsWith('.lines[].price'));
+});
+
+test('an unresolvable allOf branch is reported rather than ignored', () => {
+  const found = requestComposition(
+    { allOf: [{ type: 'object' }] },
+    { allOf: [{ $ref: '#/components/schemas/Missing' }] },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.ok(found.notices.some(f => f.code === 'UNSUPPORTED_COMPOSITION'));
+});
+
+// --- allOf: keywords the engine does not evaluate ---------------------------
+
+test('a keyword carried from a single allOf branch is still compared', () => {
+  const found = requestComposition(
+    { allOf: [{ type: 'string' }, { pattern: '^a$' }] },
+    { allOf: [{ type: 'string' }, { pattern: '^b$' }] },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.ok(found.notices.some(f =>
+    f.code === 'CONSTRAINT_NOT_COMPARED' && /`pattern` changed/.test(f.message)));
+});
+
+test('branches declaring conflicting unevaluated keywords are unmergeable', () => {
+  const found = requestComposition(
+    { allOf: [{ pattern: '^a$' }, { pattern: '^a$' }] },
+    { allOf: [{ pattern: '^a$' }, { pattern: '^b$' }] },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.ok(found.notices.some(f =>
+    f.code === 'UNSUPPORTED_COMPOSITION' && /conflicting `pattern`/.test(f.message)));
+});
+
+test('branch descriptions do not make a composition unmergeable', () => {
+  const found = requestComposition(
+    { allOf: [{ description: 'first', type: 'object' }, { description: 'second', properties: { a: { type: 'string' } } }] },
+    { allOf: [{ description: 'changed', type: 'object' }, { description: 'also changed', properties: { a: { type: 'string' } } }] },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.deepEqual(found.notices, []);
+});
+
+// --- anyOf -------------------------------------------------------------------
+
+test('reordering anyOf alternatives is not a change', () => {
+  const found = requestComposition(
+    { anyOf: [{ type: 'string' }, { type: 'integer' }] },
+    { anyOf: [{ type: 'integer' }, { type: 'string' }] },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.deepEqual(found.notices, []);
+});
+
+test('adding an anyOf alternative is compatible for requests', () => {
+  const found = requestComposition(
+    { anyOf: [{ type: 'string' }] },
+    { anyOf: [{ type: 'string' }, { type: 'integer' }] },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.deepEqual(found.notices, [], 'the accepted union only grew');
+});
+
+test('adding an anyOf alternative needs review for responses', () => {
+  const found = responseComposition(
+    { anyOf: [{ type: 'string' }] },
+    { anyOf: [{ type: 'string' }, { type: 'integer' }] },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.ok(found.notices.some(f =>
+    f.code === 'UNSUPPORTED_COMPOSITION' && /may now return instances matching the new alternative/.test(f.message)));
+});
+
+test('removing an anyOf alternative is compatible for responses', () => {
+  const found = responseComposition(
+    { anyOf: [{ type: 'string' }, { type: 'integer' }] },
+    { anyOf: [{ type: 'string' }] },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.deepEqual(found.notices, [], 'the union of returned instances only shrank');
+});
+
+test('removing an anyOf alternative needs review for requests', () => {
+  const found = requestComposition(
+    { anyOf: [{ type: 'string' }, { type: 'integer' }] },
+    { anyOf: [{ type: 'string' }] },
+  );
+  assert.deepEqual(found.breaking, [], 'another alternative may still accept the same instances');
+  assert.ok(found.notices.some(f =>
+    f.code === 'UNSUPPORTED_COMPOSITION' && /cannot be established/.test(f.message)));
+});
+
+test('an anyOf alternative changed in place needs review in both directions', () => {
+  for (const codes of [requestComposition, responseComposition]) {
+    const found = codes(
+      { anyOf: [{ type: 'string' }, { type: 'integer' }] },
+      { anyOf: [{ type: 'string' }, { type: 'boolean' }] },
+    );
+    assert.deepEqual(found.breaking, []);
+    assert.ok(found.notices.some(f => f.code === 'UNSUPPORTED_COMPOSITION'));
+  }
+});
+
+test('anyOf alternatives reached through a renamed $ref are unchanged', () => {
+  const before = {
+    openapi: '3.1.0',
+    components: { schemas: { Old: { type: 'string', minLength: 2 } } },
+    paths: { '/users': { get: { responses: { '200': { content: { 'application/json': { schema: {
+      anyOf: [{ $ref: '#/components/schemas/Old' }, { type: 'integer' }],
+    } } } } } } } },
+  };
+  const after = structuredClone(before);
+  after.components.schemas.Renamed = after.components.schemas.Old;
+  delete after.components.schemas.Old;
+  after.paths['/users'].get.responses['200'].content['application/json'].schema.anyOf[0] = {
+    $ref: '#/components/schemas/Renamed',
+  };
+  const result = compareSpecifications(before, after);
+  assert.deepEqual(result.breaking, []);
+  assert.deepEqual(result.notices, [], 'the alternatives resolve to the same schemas');
+});
+
+// --- oneOf -------------------------------------------------------------------
+
+test('reordering oneOf alternatives is not a change', () => {
+  const found = requestComposition(
+    { oneOf: [{ type: 'string' }, { type: 'integer' }] },
+    { oneOf: [{ type: 'integer' }, { type: 'string' }] },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.deepEqual(found.notices, []);
+});
+
+test('adding a oneOf alternative needs review even for requests', () => {
+  const found = requestComposition(
+    { oneOf: [{ type: 'string' }] },
+    { oneOf: [{ type: 'string' }, { minLength: 2 }] },
+  );
+  assert.deepEqual(found.breaking, [], 'overlap cannot be established, so nothing is claimed');
+  assert.ok(found.notices.some(f =>
+    f.code === 'UNSUPPORTED_COMPOSITION' && /exactly one alternative must match/.test(f.message)));
+});
+
+test('overlapping oneOf alternatives are left for review, not aggregated', () => {
+  const found = responseComposition(
+    { oneOf: [{ type: 'object', properties: { a: { type: 'string' } } }] },
+    {
+      oneOf: [
+        { type: 'object', properties: { a: { type: 'string' } } },
+        { type: 'object', properties: { a: { type: 'string' }, b: { type: 'string' } } },
+      ],
+    },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.equal(found.notices.filter(f => f.code === 'UNSUPPORTED_COMPOSITION').length, 1,
+    'one notice for the composition, not one per alternative');
+});
+
+test('removing a oneOf alternative needs review in both directions', () => {
+  for (const comparison of [requestComposition, responseComposition]) {
+    const found = comparison(
+      { oneOf: [{ type: 'string' }, { type: 'integer' }] },
+      { oneOf: [{ type: 'string' }] },
+    );
+    assert.deepEqual(found.breaking, []);
+    assert.ok(found.notices.some(f => f.code === 'UNSUPPORTED_COMPOSITION'));
+  }
+});
+
+// --- composition added or removed on one side -------------------------------
+
+test('a union added on one side only is reported for review', () => {
+  const added = requestComposition({ type: 'string' }, { anyOf: [{ type: 'string' }, { type: 'integer' }] });
+  assert.ok(added.notices.some(f =>
+    f.code === 'UNSUPPORTED_COMPOSITION' && /`anyOf` was added/.test(f.message)));
+
+  const removed = requestComposition({ oneOf: [{ type: 'string' }] }, { type: 'string' });
+  assert.ok(removed.notices.some(f =>
+    f.code === 'UNSUPPORTED_COMPOSITION' && /`oneOf` was removed/.test(f.message)));
+});
+
+test('a union sitting beside merged allOf constraints is still reported', () => {
+  const found = requestComposition(
+    { allOf: [{ type: 'object', properties: { a: { type: 'string' } } }, { oneOf: [{ required: ['a'] }] }] },
+    { allOf: [{ type: 'object', properties: { a: { type: 'string' } } }, { oneOf: [{ required: ['a'] }, { required: [] }] }] },
+  );
+  assert.ok(found.notices.some(f => f.code === 'UNSUPPORTED_COMPOSITION' && /`oneOf`/.test(f.message)));
+});
+
+test('conflicting unions in two allOf branches are unmergeable', () => {
+  const found = requestComposition(
+    { allOf: [{ oneOf: [{ type: 'string' }] }, { oneOf: [{ type: 'string' }] }] },
+    { allOf: [{ oneOf: [{ type: 'string' }] }, { oneOf: [{ type: 'integer' }] }] },
+  );
+  assert.deepEqual(found.breaking, []);
+  assert.ok(found.notices.some(f =>
+    f.code === 'UNSUPPORTED_COMPOSITION' && /conflicting `oneOf`/.test(f.message)));
+});
+
+// --- recursion and cycle safety ---------------------------------------------
+
+test('a recursive schema composed with allOf terminates and is compared', () => {
+  const before = {
+    openapi: '3.1.0',
+    components: { schemas: {
+      Base: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+      Node: { allOf: [
+        { $ref: '#/components/schemas/Base' },
+        { properties: { child: { $ref: '#/components/schemas/Node' } } },
+      ] },
+    } },
+    paths: { '/tree': { get: { responses: { '200': { content: { 'application/json': {
+      schema: { $ref: '#/components/schemas/Node' },
+    } } } } } } },
+  };
+  const after = structuredClone(before);
+  after.components.schemas.Base.required = [];
+  const result = compareSpecifications(before, after);
+  assert.ok(result.breaking.some(f => f.code === 'RESPONSE_FIELD_OPTIONAL'));
+});
+
+test('an allOf branch referencing its own schema is reported, not looped', () => {
+  const before = {
+    openapi: '3.1.0',
+    components: { schemas: { Loop: { allOf: [{ $ref: '#/components/schemas/Loop' }, { type: 'object' }] } } },
+    paths: { '/loop': { get: { responses: { '200': { content: { 'application/json': {
+      schema: { $ref: '#/components/schemas/Loop' },
+    } } } } } } },
+  };
+  const after = structuredClone(before);
+  after.components.schemas.Loop.allOf[1] = { type: 'string' };
+  const result = compareSpecifications(before, after);
+  assert.deepEqual(result.breaking, []);
+  assert.ok(result.notices.some(f => f.code === 'UNSUPPORTED_COMPOSITION'));
+});
+
+test('mutually recursive composed schemas terminate', () => {
+  const before = {
+    openapi: '3.1.0',
+    components: { schemas: {
+      A: { allOf: [{ type: 'object', properties: { b: { $ref: '#/components/schemas/B' } } }] },
+      B: { allOf: [{ type: 'object', properties: { a: { $ref: '#/components/schemas/A' } } }] },
+    } },
+    paths: { '/a': { get: { responses: { '200': { content: { 'application/json': {
+      schema: { $ref: '#/components/schemas/A' },
+    } } } } } } },
+  };
+  const after = structuredClone(before);
+  after.components.schemas.B.allOf[0].properties.extra = { type: 'string' };
+  const result = compareSpecifications(before, after);
+  assert.deepEqual(result.breaking, [], 'adding a response field is compatible');
+});
+
+test('a recursive schema whose property merges two branches terminates', () => {
+  const before = {
+    openapi: '3.1.0',
+    components: { schemas: { Node: { allOf: [
+      { type: 'object', properties: { child: { $ref: '#/components/schemas/Node' } } },
+      { properties: { child: { nullable: true } } },
+    ] } } },
+    paths: { '/node': { get: { responses: { '200': { content: { 'application/json': {
+      schema: { $ref: '#/components/schemas/Node' },
+    } } } } } } },
+  };
+  const after = structuredClone(before);
+  const result = compareSpecifications(before, after);
+  assert.deepEqual(result.breaking, []);
 });

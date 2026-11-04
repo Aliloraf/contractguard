@@ -3,6 +3,6 @@
   "compilerOptions": {
     "types": []
   },
-  "include": ["src/types.ts", "src/comparator.ts", "src/report.ts"],
+  "include": ["src/types.ts", "src/schema.ts", "src/composition.ts", "src/comparator.ts", "src/report.ts"],
   "exclude": []
 }
