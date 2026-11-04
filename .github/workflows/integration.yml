@@ -1,0 +1,47 @@
+# Runs ContractGuard from this checkout against a tracked specification, so the
+# bundled Action is exercised the way consumers use it.
+#
+# Deliberately uses the pull_request event with a read-only token and no
+# secrets: a pull request from a fork runs its own bundled dist/index.js, so the
+# job must never be given write permissions or secret access. The job summary is
+# the whole output; commenting needs pull-requests: write and is left to
+# consumers to enable.
+name: Action integration
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: action-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  self-check:
+    name: Run the bundled Action on a tracked specification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # ContractGuard reads the previous specification out of Git history,
+          # so the base commit has to be present locally.
+          fetch-depth: 0
+
+      - name: Run ContractGuard
+        id: contractguard
+        uses: ./
+        with:
+          spec-path: examples/before.yaml
+
+      - name: Check the reported outputs
+        env:
+          BREAKING: ${{ steps.contractguard.outputs.breaking }}
+          BREAKING_COUNT: ${{ steps.contractguard.outputs.breaking-count }}
+          NOTICE_COUNT: ${{ steps.contractguard.outputs.notice-count }}
+        run: |
+          echo "breaking=$BREAKING breaking-count=$BREAKING_COUNT notice-count=$NOTICE_COUNT"
+          test -n "$BREAKING" || { echo "the Action set no outputs"; exit 1; }
+          test "$BREAKING" = "false" || { echo "unexpected breaking change in the tracked example"; exit 1; }
+          test "$BREAKING_COUNT" = "0" || exit 1

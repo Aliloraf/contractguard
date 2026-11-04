@@ -5,20 +5,29 @@ branding:
 description: Detect potentially breaking OpenAPI changes in pull requests.
 inputs:
   spec-path:
-    description: Relative path to the OpenAPI YAML or JSON document.
+    description: >-
+      Repository-relative path to the OpenAPI 3.0/3.1 YAML or JSON document.
+      Absolute paths, and paths outside the checkout, are rejected.
     required: true
   comment:
-    description: Post or update a pull request comment (requires permission).
+    description: >-
+      Post or update a pull request comment with the report. Requires
+      github-token and pull-requests: write permission. A comment that cannot be
+      posted is reported as a warning and never changes the check result.
     required: false
     default: 'false'
   github-token:
-    description: GITHUB_TOKEN used for optional PR comments.
+    description: GITHUB_TOKEN (or a PAT) used for the optional pull request comment.
     required: false
 outputs:
+  breaking:
+    description: '"true" when at least one breaking change was detected.'
   breaking-count:
     description: Number of detected breaking changes.
-  breaking:
-    description: Whether at least one breaking change was detected.
+  notice-count:
+    description: >-
+      Number of places that could not be evaluated and need a manual review.
+      These never fail the check on their own.
 runs:
   using: node24
   main: dist/index.js
