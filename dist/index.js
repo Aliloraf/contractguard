@@ -32304,6 +32304,33 @@ exports.compareSpecifications = compareSpecifications;
 const METHODS = ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace'];
 /** Schema keywords whose semantics this rule set cannot evaluate yet. */
 const COMPOSITION_KEYWORDS = ['allOf', 'oneOf', 'anyOf', 'not'];
+/**
+ * Validation keywords that affect compatibility but cannot be compared
+ * reliably: `pattern` would need regular expression inclusion analysis,
+ * `format` needs a registry of value spaces, and the rest need instance-level
+ * reasoning. A change to any of them is surfaced as a notice rather than
+ * passed over as compatible.
+ */
+const UNCOMPARED_CONSTRAINTS = [
+    'multipleOf',
+    'pattern',
+    'format',
+    'uniqueItems',
+    'contains',
+    'minContains',
+    'maxContains',
+    'minProperties',
+    'maxProperties',
+    'patternProperties',
+    'propertyNames',
+    'dependentRequired',
+    'dependentSchemas',
+    'const',
+    'readOnly',
+    'writeOnly',
+    'unevaluatedProperties',
+    'unevaluatedItems',
+];
 function record(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value)
         ? value
@@ -32384,12 +32411,144 @@ function enumValues(schema) {
 function isClosedObject(schema) {
     return schema.additionalProperties === false;
 }
+const NUMERIC_TYPES = ['number', 'integer'];
 /**
- * Whether `additionalProperties` can matter here at all. This only gates
- * reporting; it makes no claim about the instance type.
+ * Whether a validation keyword can affect any instance either side accepts.
+ * A keyword only constrains instances of the types it applies to, so comparing
+ * `minLength` on a pair of schemas that are both declared `number` would be
+ * noise. An undeclared type means any instance is possible, so the keyword can
+ * bite; this asks what the keywords constrain and never infers a type.
  */
-function constrainsObjectProperties(schema) {
-    return effectiveTypes(schema).has('object') || Object.keys(record(schema.properties)).length > 0;
+function constraintApplies(oldSchema, newSchema, applicable) {
+    const combined = new Set([...effectiveTypes(oldSchema), ...effectiveTypes(newSchema)]);
+    if (combined.size === 0)
+        return true;
+    return applicable.some(type => combined.has(type));
+}
+const LOWER_UNBOUNDED = { limit: -Infinity, exclusive: false };
+const UPPER_UNBOUNDED = { limit: Infinity, exclusive: false };
+function isTighterLower(next, previous) {
+    if (next.limit !== previous.limit)
+        return next.limit > previous.limit;
+    return next.exclusive && !previous.exclusive;
+}
+function isTighterUpper(next, previous) {
+    if (next.limit !== previous.limit)
+        return next.limit < previous.limit;
+    return next.exclusive && !previous.exclusive;
+}
+function formatLower(bound) {
+    return bound.limit === -Infinity ? 'unbounded' : `${bound.exclusive ? '>' : '>='} ${bound.limit}`;
+}
+function formatUpper(bound) {
+    return bound.limit === Infinity ? 'unbounded' : `${bound.exclusive ? '<' : '<='} ${bound.limit}`;
+}
+/** True when only integers are permitted, so exclusive bounds can be snapped. */
+function isIntegerOnly(schema) {
+    const types = effectiveTypes(schema);
+    return types.has('integer') && !types.has('number');
+}
+/** `exclusiveMinimum: 4` and `minimum: 5` accept the same integers. */
+function snapLowerToInteger(bound) {
+    if (!bound.exclusive || !Number.isFinite(bound.limit))
+        return bound;
+    return {
+        limit: Number.isInteger(bound.limit) ? bound.limit + 1 : Math.ceil(bound.limit),
+        exclusive: false,
+    };
+}
+function snapUpperToInteger(bound) {
+    if (!bound.exclusive || !Number.isFinite(bound.limit))
+        return bound;
+    return {
+        limit: Number.isInteger(bound.limit) ? bound.limit - 1 : Math.floor(bound.limit),
+        exclusive: false,
+    };
+}
+/**
+ * The effective lower bound, accepting both dialects: OpenAPI 3.0 writes
+ * `minimum` with a boolean `exclusiveMinimum`, OpenAPI 3.1 writes a numeric
+ * `exclusiveMinimum`. When both appear the stricter one wins.
+ */
+function numericLowerBound(schema) {
+    let bound = LOWER_UNBOUNDED;
+    const minimum = schema.minimum;
+    const exclusive = schema.exclusiveMinimum;
+    if (typeof minimum === 'number') {
+        const candidate = { limit: minimum, exclusive: exclusive === true };
+        if (isTighterLower(candidate, bound))
+            bound = candidate;
+    }
+    if (typeof exclusive === 'number') {
+        const candidate = { limit: exclusive, exclusive: true };
+        if (isTighterLower(candidate, bound))
+            bound = candidate;
+    }
+    return isIntegerOnly(schema) ? snapLowerToInteger(bound) : bound;
+}
+function numericUpperBound(schema) {
+    let bound = UPPER_UNBOUNDED;
+    const maximum = schema.maximum;
+    const exclusive = schema.exclusiveMaximum;
+    if (typeof maximum === 'number') {
+        const candidate = { limit: maximum, exclusive: exclusive === true };
+        if (isTighterUpper(candidate, bound))
+            bound = candidate;
+    }
+    if (typeof exclusive === 'number') {
+        const candidate = { limit: exclusive, exclusive: true };
+        if (isTighterUpper(candidate, bound))
+            bound = candidate;
+    }
+    return isIntegerOnly(schema) ? snapUpperToInteger(bound) : bound;
+}
+/** An absent `minLength`/`minItems` is the same as zero. */
+function countLowerBound(schema, keyword) {
+    const value = schema[keyword];
+    return { limit: typeof value === 'number' ? value : 0, exclusive: false };
+}
+/** An absent `maxLength`/`maxItems` imposes no upper limit. */
+function countUpperBound(schema, keyword) {
+    const value = schema[keyword];
+    return { limit: typeof value === 'number' ? value : Infinity, exclusive: false };
+}
+const RANGE_RULES = {
+    range: { narrowed: 'REQUEST_RANGE_NARROWED', widened: 'RESPONSE_RANGE_WIDENED' },
+    length: { narrowed: 'REQUEST_LENGTH_NARROWED', widened: 'RESPONSE_LENGTH_WIDENED' },
+    items: { narrowed: 'REQUEST_ITEM_COUNT_NARROWED', widened: 'RESPONSE_ITEM_COUNT_WIDENED' },
+};
+/**
+ * A request may only accept more than before and a response may only return
+ * less, so a tightened request bound and a relaxed response bound both break
+ * deployed clients.
+ */
+function compareBound(before, after, edge, family, label, location, direction, report) {
+    const isTighter = edge === 'lower' ? isTighterLower : isTighterUpper;
+    const format = edge === 'lower' ? formatLower : formatUpper;
+    const rules = RANGE_RULES[family];
+    if (direction === 'request') {
+        if (isTighter(after, before)) {
+            report.breaking(rules.narrowed, location, `${label} tightened (${format(before)} → ${format(after)}); requests that were valid are now rejected.`);
+        }
+        return;
+    }
+    if (isTighter(before, after)) {
+        report.breaking(rules.widened, location, `${label} relaxed (${format(before)} → ${format(after)}); responses may now fall outside the documented range.`);
+    }
+}
+function compareConstraints(oldSchema, newSchema, location, direction, report) {
+    if (constraintApplies(oldSchema, newSchema, NUMERIC_TYPES)) {
+        compareBound(numericLowerBound(oldSchema), numericLowerBound(newSchema), 'lower', 'range', 'Minimum', location, direction, report);
+        compareBound(numericUpperBound(oldSchema), numericUpperBound(newSchema), 'upper', 'range', 'Maximum', location, direction, report);
+    }
+    if (constraintApplies(oldSchema, newSchema, ['string'])) {
+        compareBound(countLowerBound(oldSchema, 'minLength'), countLowerBound(newSchema, 'minLength'), 'lower', 'length', 'Minimum length', location, direction, report);
+        compareBound(countUpperBound(oldSchema, 'maxLength'), countUpperBound(newSchema, 'maxLength'), 'upper', 'length', 'Maximum length', location, direction, report);
+    }
+    if (constraintApplies(oldSchema, newSchema, ['array'])) {
+        compareBound(countLowerBound(oldSchema, 'minItems'), countLowerBound(newSchema, 'minItems'), 'lower', 'items', 'Minimum item count', location, direction, report);
+        compareBound(countUpperBound(oldSchema, 'maxItems'), countUpperBound(newSchema, 'maxItems'), 'upper', 'items', 'Maximum item count', location, direction, report);
+    }
 }
 /**
  * A request may widen its accepted types; a response may only narrow the types
@@ -32466,6 +32625,35 @@ function noteUnevaluatedKeywords(oldSchema, newSchema, location, report) {
         report.notice('UNSUPPORTED_TUPLE_ITEMS', location, 'Tuple validation (`prefixItems`) is not evaluated; review positional array changes manually.');
     }
 }
+function describeConstraint(value) {
+    if (value === undefined)
+        return 'absent';
+    const text = valueKey(value);
+    return text.length > 60 ? `${text.slice(0, 57)}...` : text;
+}
+/**
+ * Reports validation keywords that changed but cannot be evaluated, so a clean
+ * breaking list is never mistaken for proof that the constraint still holds.
+ * An unchanged keyword cannot affect compatibility, so it stays quiet.
+ */
+function noteChangedConstraints(oldSchema, newSchema, location, report) {
+    for (const keyword of UNCOMPARED_CONSTRAINTS) {
+        const before = oldSchema[keyword];
+        const after = newSchema[keyword];
+        if (before === undefined && after === undefined)
+            continue;
+        if (valueKey(before) === valueKey(after))
+            continue;
+        report.notice('CONSTRAINT_NOT_COMPARED', location, `\`${keyword}\` changed (${describeConstraint(before)} → ${describeConstraint(after)}); this constraint is not evaluated and must be reviewed manually.`);
+    }
+    const beforeExtras = oldSchema.additionalProperties;
+    const afterExtras = newSchema.additionalProperties;
+    if (typeof beforeExtras === 'object' && beforeExtras !== null
+        && typeof afterExtras === 'object' && afterExtras !== null
+        && valueKey(beforeExtras) !== valueKey(afterExtras)) {
+        report.notice('CONSTRAINT_NOT_COMPARED', location, 'The `additionalProperties` subschema changed; undeclared property compatibility was not evaluated.');
+    }
+}
 function compareSchema(oldRoot, newRoot, oldRaw, newRaw, location, direction, report, seen) {
     const oldSchema = resolve(oldRoot, oldRaw);
     const newSchema = resolve(newRoot, newRaw);
@@ -32477,8 +32665,10 @@ function compareSchema(oldRoot, newRoot, oldRaw, newRaw, location, direction, re
     else
         seen.set(oldSchema, new WeakSet([newSchema]));
     noteUnevaluatedKeywords(oldSchema, newSchema, location, report);
+    noteChangedConstraints(oldSchema, newSchema, location, report);
     compareTypes(oldSchema, newSchema, location, direction, report);
     compareEnums(oldSchema, newSchema, location, direction, report);
+    compareConstraints(oldSchema, newSchema, location, direction, report);
     const oldProperties = record(oldSchema.properties);
     const newProperties = record(newSchema.properties);
     const oldRequired = new Set(strings(oldSchema.required));
@@ -32490,7 +32680,7 @@ function compareSchema(oldRoot, newRoot, oldRaw, newRaw, location, direction, re
             }
         }
         if (!isClosedObject(oldSchema) && isClosedObject(newSchema)
-            && (constrainsObjectProperties(oldSchema) || constrainsObjectProperties(newSchema))) {
+            && constraintApplies(oldSchema, newSchema, ['object'])) {
             report.breaking('REQUEST_OBJECT_CLOSED', location, 'Object now rejects undeclared properties (additionalProperties: false); requests carrying extra fields are refused.');
         }
         for (const name of Object.keys(oldProperties)) {

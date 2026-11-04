@@ -481,3 +481,411 @@ test('integer and number stay unrelated to other types', () => {
   responseSchema(after).properties.id.type = 'integer';
   assert.ok(codes(before, after).includes('SCHEMA_TYPE_CHANGED'), 'string -> integer is still a response break');
 });
+
+// ===========================================================================
+// Schema validation constraints
+// ===========================================================================
+
+/** Applies `patch` to the named request body property of a fresh fixture. */
+function withRequestProperty(name, patch) {
+  const spec = base();
+  Object.assign(requestSchema(spec).properties[name], patch);
+  return spec;
+}
+
+/** Applies `patch` to the named response property of a fresh fixture. */
+function withResponseProperty(name, patch) {
+  const spec = base();
+  Object.assign(responseSchema(spec).properties[name], patch);
+  return spec;
+}
+
+function requestChange(name, before, after) {
+  return codes(withRequestProperty(name, before), withRequestProperty(name, after));
+}
+
+function responseChange(name, before, after) {
+  return codes(withResponseProperty(name, before), withResponseProperty(name, after));
+}
+
+/** The fixture's response `id` is a string, so numeric cases declare a type. */
+function numericResponseChange(before, after) {
+  return responseChange('id', { type: 'number', ...before }, { type: 'number', ...after });
+}
+
+// --- Numeric constraints: minimum / maximum ---------------------------------
+
+test('raising a request minimum is breaking, lowering it is compatible', () => {
+  assert.ok(requestChange('age', { minimum: 0 }, { minimum: 18 }).includes('REQUEST_RANGE_NARROWED'));
+  assert.deepEqual(requestChange('age', { minimum: 18 }, { minimum: 0 }), []);
+});
+
+test('lowering a request maximum is breaking, raising it is compatible', () => {
+  assert.ok(requestChange('age', { maximum: 100 }, { maximum: 60 }).includes('REQUEST_RANGE_NARROWED'));
+  assert.deepEqual(requestChange('age', { maximum: 60 }, { maximum: 100 }), []);
+});
+
+test('adding a request bound is breaking, removing one is compatible', () => {
+  assert.ok(requestChange('age', {}, { minimum: 18 }).includes('REQUEST_RANGE_NARROWED'));
+  assert.ok(requestChange('age', {}, { maximum: 60 }).includes('REQUEST_RANGE_NARROWED'));
+  assert.deepEqual(requestChange('age', { minimum: 18, maximum: 60 }, {}), []);
+});
+
+test('relaxing a response bound is breaking, tightening it is compatible', () => {
+  assert.ok(numericResponseChange({ minimum: 0 }, { minimum: -10 }).includes('RESPONSE_RANGE_WIDENED'));
+  assert.ok(numericResponseChange({ maximum: 100 }, { maximum: 1000 }).includes('RESPONSE_RANGE_WIDENED'));
+  assert.deepEqual(numericResponseChange({ minimum: 0, maximum: 100 }, { minimum: 10, maximum: 90 }), []);
+});
+
+test('removing a response bound is breaking, adding one is compatible', () => {
+  assert.ok(numericResponseChange({ minimum: 0 }, {}).includes('RESPONSE_RANGE_WIDENED'));
+  assert.ok(numericResponseChange({ maximum: 100 }, {}).includes('RESPONSE_RANGE_WIDENED'));
+  assert.deepEqual(numericResponseChange({}, { minimum: 0, maximum: 100 }), []);
+});
+
+test('an unchanged bound reports nothing in either direction', () => {
+  assert.deepEqual(requestChange('age', { minimum: 1, maximum: 9 }, { minimum: 1, maximum: 9 }), []);
+  assert.deepEqual(numericResponseChange({ minimum: 1, maximum: 9 }, { minimum: 1, maximum: 9 }), []);
+});
+
+test('tightening both numeric bounds at once reports both edges', () => {
+  const found = compareSpecifications(
+    withRequestProperty('age', { minimum: 0, maximum: 100 }),
+    withRequestProperty('age', { minimum: 10, maximum: 90 }),
+  ).breaking.filter(f => f.code === 'REQUEST_RANGE_NARROWED');
+  assert.equal(found.length, 2);
+  assert.ok(found.some(f => /Minimum tightened/.test(f.message)));
+  assert.ok(found.some(f => /Maximum tightened/.test(f.message)));
+});
+
+// --- Exclusive bounds: 3.0 boolean form vs 3.1 numeric form -----------------
+
+test('an inclusive bound becoming exclusive is breaking for requests', () => {
+  assert.ok(requestChange('age', { minimum: 5 }, { minimum: 5, exclusiveMinimum: true })
+    .includes('REQUEST_RANGE_NARROWED'));
+  assert.ok(requestChange('age', { maximum: 5 }, { maximum: 5, exclusiveMaximum: true })
+    .includes('REQUEST_RANGE_NARROWED'));
+});
+
+test('an exclusive bound becoming inclusive is breaking for responses', () => {
+  assert.ok(numericResponseChange({ minimum: 5, exclusiveMinimum: true }, { minimum: 5 })
+    .includes('RESPONSE_RANGE_WIDENED'));
+  assert.ok(numericResponseChange({ maximum: 5, exclusiveMaximum: true }, { maximum: 5 })
+    .includes('RESPONSE_RANGE_WIDENED'));
+});
+
+test('an exclusive bound becoming inclusive is compatible for requests', () => {
+  assert.deepEqual(requestChange('age', { minimum: 5, exclusiveMinimum: true }, { minimum: 5 }), []);
+  assert.deepEqual(requestChange('age', { maximum: 5, exclusiveMaximum: true }, { maximum: 5 }), []);
+});
+
+test('the 3.0 boolean form and the 3.1 numeric form are equivalent', () => {
+  assert.deepEqual(requestChange('age', { minimum: 5, exclusiveMinimum: true }, { exclusiveMinimum: 5 }), []);
+  assert.deepEqual(numericResponseChange({ minimum: 5, exclusiveMinimum: true }, { exclusiveMinimum: 5 }), []);
+  assert.deepEqual(requestChange('age', { maximum: 5, exclusiveMaximum: true }, { exclusiveMaximum: 5 }), []);
+  assert.deepEqual(numericResponseChange({ maximum: 5, exclusiveMaximum: true }, { exclusiveMaximum: 5 }), []);
+});
+
+test('an explicit exclusiveMinimum: false is the same as omitting it', () => {
+  assert.deepEqual(requestChange('age', { minimum: 5 }, { minimum: 5, exclusiveMinimum: false }), []);
+  assert.deepEqual(numericResponseChange({ maximum: 5 }, { maximum: 5, exclusiveMaximum: false }), []);
+});
+
+test('the stricter bound wins when minimum and numeric exclusiveMinimum disagree', () => {
+  assert.deepEqual(requestChange('age', { exclusiveMinimum: 5 }, { minimum: 1, exclusiveMinimum: 5 }), []);
+  assert.ok(requestChange('age', { minimum: 1 }, { minimum: 1, exclusiveMinimum: 5 })
+    .includes('REQUEST_RANGE_NARROWED'));
+});
+
+test('the 3.1 numeric exclusive form compares as a real bound', () => {
+  assert.ok(requestChange('age', { exclusiveMinimum: 1 }, { exclusiveMinimum: 5 })
+    .includes('REQUEST_RANGE_NARROWED'));
+  assert.deepEqual(requestChange('age', { exclusiveMinimum: 5 }, { exclusiveMinimum: 1 }), []);
+  assert.ok(numericResponseChange({ exclusiveMaximum: 5 }, { exclusiveMaximum: 50 })
+    .includes('RESPONSE_RANGE_WIDENED'));
+});
+
+test('exclusive and inclusive integer bounds that accept the same values are equivalent', () => {
+  assert.deepEqual(requestChange('age', { type: 'integer', minimum: 5 }, { type: 'integer', exclusiveMinimum: 4 }), []);
+  assert.deepEqual(responseChange('id', { type: 'integer', exclusiveMinimum: 4 }, { type: 'integer', minimum: 5 }), []);
+  assert.deepEqual(requestChange('age', { exclusiveMaximum: 6 }, { maximum: 5 }), [], 'integer fixture property');
+  assert.deepEqual(requestChange('age', { type: 'integer', maximum: 5 }, { type: 'integer', exclusiveMaximum: 6 }), []);
+});
+
+test('bounds are not snapped for number-typed schemas', () => {
+  assert.ok(responseChange('id', { type: 'number', minimum: 5 }, { type: 'number', exclusiveMinimum: 4 })
+    .includes('RESPONSE_RANGE_WIDENED'));
+  assert.deepEqual(requestChange('age', { type: 'number', minimum: 5 }, { type: 'number', exclusiveMinimum: 4 }), []);
+});
+
+// --- String constraints: minLength / maxLength -------------------------------
+
+test('raising a request minLength is breaking, lowering it is compatible', () => {
+  assert.ok(requestChange('name', { minLength: 1 }, { minLength: 8 }).includes('REQUEST_LENGTH_NARROWED'));
+  assert.deepEqual(requestChange('name', { minLength: 8 }, { minLength: 1 }), []);
+});
+
+test('lowering a request maxLength is breaking, raising it is compatible', () => {
+  assert.ok(requestChange('name', { maxLength: 100 }, { maxLength: 20 }).includes('REQUEST_LENGTH_NARROWED'));
+  assert.deepEqual(requestChange('name', { maxLength: 20 }, { maxLength: 100 }), []);
+});
+
+test('adding a request length constraint is breaking, removing one is compatible', () => {
+  assert.ok(requestChange('name', {}, { maxLength: 20 }).includes('REQUEST_LENGTH_NARROWED'));
+  assert.deepEqual(requestChange('name', { minLength: 2, maxLength: 20 }, {}), []);
+});
+
+test('relaxing a response length guarantee is breaking', () => {
+  assert.ok(responseChange('name', { maxLength: 20 }, { maxLength: 200 }).includes('RESPONSE_LENGTH_WIDENED'));
+  assert.ok(responseChange('name', { maxLength: 20 }, {}).includes('RESPONSE_LENGTH_WIDENED'));
+  assert.ok(responseChange('name', { minLength: 5 }, { minLength: 1 }).includes('RESPONSE_LENGTH_WIDENED'));
+});
+
+test('tightening a response length guarantee is compatible', () => {
+  assert.deepEqual(responseChange('name', { minLength: 1, maxLength: 200 }, { minLength: 5, maxLength: 20 }), []);
+  assert.deepEqual(responseChange('name', {}, { minLength: 5, maxLength: 20 }), []);
+});
+
+test('an absent minimum length is the same as zero', () => {
+  assert.deepEqual(requestChange('name', {}, { minLength: 0 }), []);
+  assert.deepEqual(requestChange('name', { minLength: 0 }, {}), []);
+  assert.deepEqual(responseChange('name', {}, { minLength: 0 }), []);
+  assert.deepEqual(responseChange('name', { minLength: 0 }, {}), []);
+});
+
+test('length constraints are ignored on schemas that cannot be strings', () => {
+  assert.deepEqual(requestChange('age', { maxLength: 5 }, { maxLength: 2 }), []);
+  assert.deepEqual(responseChange('id', { type: 'number', maxLength: 5 }, { type: 'number' }), []);
+});
+
+test('numeric constraints are ignored on schemas that cannot be numbers', () => {
+  assert.deepEqual(requestChange('name', { minimum: 1 }, { minimum: 5 }), []);
+  assert.deepEqual(responseChange('id', { minimum: 0 }, {}), []);
+});
+
+test('constraints are compared when neither side declares a type', () => {
+  const before = base(), after = base();
+  requestSchema(before).properties.value = { maxLength: 50 };
+  requestSchema(after).properties.value = { maxLength: 10 };
+  assert.ok(codes(before, after).includes('REQUEST_LENGTH_NARROWED'));
+});
+
+// --- Array constraints: minItems / maxItems ---------------------------------
+
+const arrayProperty = (extra) => ({ type: 'array', items: { type: 'string' }, ...extra });
+
+test('tightening request item counts is breaking, relaxing them is compatible', () => {
+  assert.ok(requestChange('name', arrayProperty({ minItems: 0 }), arrayProperty({ minItems: 2 }))
+    .includes('REQUEST_ITEM_COUNT_NARROWED'));
+  assert.ok(requestChange('name', arrayProperty({ maxItems: 10 }), arrayProperty({ maxItems: 5 }))
+    .includes('REQUEST_ITEM_COUNT_NARROWED'));
+  assert.deepEqual(requestChange('name', arrayProperty({ minItems: 2, maxItems: 5 }), arrayProperty({})), []);
+});
+
+test('relaxing response item counts is breaking, tightening them is compatible', () => {
+  assert.ok(responseChange('name', arrayProperty({ maxItems: 5 }), arrayProperty({ maxItems: 50 }))
+    .includes('RESPONSE_ITEM_COUNT_WIDENED'));
+  assert.ok(responseChange('name', arrayProperty({ minItems: 1 }), arrayProperty({}))
+    .includes('RESPONSE_ITEM_COUNT_WIDENED'));
+  assert.deepEqual(responseChange('name', arrayProperty({}), arrayProperty({ minItems: 1, maxItems: 5 })), []);
+});
+
+test('an absent minimum item count is the same as zero', () => {
+  assert.deepEqual(requestChange('name', arrayProperty({}), arrayProperty({ minItems: 0 })), []);
+  assert.deepEqual(responseChange('name', arrayProperty({ minItems: 0 }), arrayProperty({})), []);
+});
+
+test('item count constraints are ignored on schemas that cannot be arrays', () => {
+  assert.deepEqual(requestChange('age', { minItems: 1 }, { minItems: 5 }), []);
+});
+
+// --- Nesting, arrays of objects and $ref ------------------------------------
+
+test('constraints are compared inside nested objects and array elements', () => {
+  const before = base(), after = base();
+  for (const spec of [before, after]) {
+    responseSchema(spec).properties.lines = {
+      type: 'array',
+      items: { type: 'object', properties: { price: { type: 'number', maximum: 100 } } },
+    };
+  }
+  responseSchema(after).properties.lines.items.properties.price.maximum = 1000;
+  const found = compareSpecifications(before, after).breaking;
+  assert.ok(found.some(f =>
+    f.code === 'RESPONSE_RANGE_WIDENED' && f.location.endsWith('.lines[].price')));
+});
+
+test('constraints are compared through internal $ref indirection', () => {
+  const before = {
+    openapi: '3.1.0',
+    components: { schemas: { Price: { type: 'number', minimum: 0, maximum: 100 } } },
+    paths: { '/items': {
+      get: { responses: { '200': { content: { 'application/json': { schema: {
+        type: 'object', properties: { price: { $ref: '#/components/schemas/Price' } },
+      } } } } } },
+      post: { requestBody: { content: { 'application/json': { schema: {
+        type: 'object', properties: { price: { $ref: '#/components/schemas/Price' } },
+      } } } }, responses: { '201': { description: 'Created' } } },
+    } },
+  };
+  const after = structuredClone(before);
+  after.components.schemas.Price.minimum = 10;
+  const found = compareSpecifications(before, after).breaking;
+  assert.ok(found.some(f => f.code === 'RESPONSE_RANGE_WIDENED' || f.code === 'REQUEST_RANGE_NARROWED'),
+    'a shared referenced schema is compared in both directions');
+  assert.ok(found.some(f => f.code === 'REQUEST_RANGE_NARROWED' && f.location.includes('POST /items request')));
+});
+
+test('constraints are compared on parameter schemas', () => {
+  const before = base(), after = base();
+  before.paths['/users'].get.parameters[0].schema = { type: 'integer', minimum: 1, maximum: 100 };
+  after.paths['/users'].get.parameters[0].schema = { type: 'integer', minimum: 1, maximum: 50 };
+  const found = compareSpecifications(before, after).breaking;
+  assert.ok(found.some(f => f.code === 'REQUEST_RANGE_NARROWED' && f.location.includes('query:page')));
+});
+
+test('constraints combine with enum and type findings at the same location', () => {
+  const before = base(), after = base();
+  requestSchema(before).properties.age = { type: 'integer', minimum: 0 };
+  requestSchema(after).properties.age = { type: 'integer', minimum: 5, enum: [5, 6] };
+  const found = codes(before, after).sort();
+  assert.deepEqual(found, ['REQUEST_ENUM_NARROWED', 'REQUEST_RANGE_NARROWED']);
+});
+
+// --- Object constraints: the untyped additionalProperties gap ---------------
+
+test('closing an untyped schema is breaking for requests', () => {
+  const before = base(), after = base();
+  requestSchema(before).properties.profile = {};
+  requestSchema(after).properties.profile = { additionalProperties: false };
+  const found = compareSpecifications(before, after).breaking;
+  assert.ok(found.some(f => f.code === 'REQUEST_OBJECT_CLOSED' && f.location.endsWith('.profile')));
+});
+
+test('closing an untyped schema does not claim the instance is an object', () => {
+  const before = base(), after = base();
+  requestSchema(before).properties.profile = {};
+  requestSchema(after).properties.profile = { additionalProperties: false };
+  assert.ok(!codes(before, after).includes('SCHEMA_TYPE_CHANGED'));
+});
+
+test('closing an object is not reported for responses', () => {
+  const before = base(), after = base();
+  responseSchema(before).properties.profile = {};
+  responseSchema(after).properties.profile = { additionalProperties: false };
+  assert.deepEqual(codes(before, after), []);
+});
+
+test('additionalProperties is ignored on schemas that cannot be objects', () => {
+  const before = base(), after = base();
+  requestSchema(before).properties.name = { type: 'string' };
+  requestSchema(after).properties.name = { type: 'string', additionalProperties: false };
+  assert.deepEqual(codes(before, after), []);
+});
+
+test('closing a schema that only declares properties is still breaking', () => {
+  const before = base(), after = base();
+  requestSchema(before).properties.profile = { properties: { city: { type: 'string' } } };
+  requestSchema(after).properties.profile = { properties: { city: { type: 'string' } }, additionalProperties: false };
+  assert.ok(codes(before, after).includes('REQUEST_OBJECT_CLOSED'));
+});
+
+// --- Constraints that cannot be evaluated reliably --------------------------
+
+test('a changed pattern is reported as a review-required notice', () => {
+  const before = base(), after = base();
+  requestSchema(before).properties.name.pattern = '^[a-z]+$';
+  requestSchema(after).properties.name.pattern = '^[a-z]{3,}$';
+  const result = compareSpecifications(before, after);
+  assert.deepEqual(result.breaking, []);
+  assert.ok(result.notices.some(f =>
+    f.code === 'CONSTRAINT_NOT_COMPARED' && /`pattern` changed/.test(f.message)));
+});
+
+test('an unchanged pattern produces no notice', () => {
+  const before = base(), after = base();
+  requestSchema(before).properties.name.pattern = '^[a-z]+$';
+  requestSchema(after).properties.name.pattern = '^[a-z]+$';
+  assert.deepEqual(compareSpecifications(before, after).notices, []);
+});
+
+test('an added or removed pattern is reported', () => {
+  const added = base(), addedAfter = base();
+  addedAfter.paths['/users'].post.requestBody.content['application/json'].schema.properties.name.pattern = '^x$';
+  assert.ok(compareSpecifications(added, addedAfter).notices.some(f =>
+    f.code === 'CONSTRAINT_NOT_COMPARED' && /absent → /.test(f.message)));
+
+  const removed = base(), removedAfter = base();
+  removed.paths['/users'].post.requestBody.content['application/json'].schema.properties.name.pattern = '^x$';
+  assert.ok(compareSpecifications(removed, removedAfter).notices.some(f =>
+    f.code === 'CONSTRAINT_NOT_COMPARED' && / → absent/.test(f.message)));
+});
+
+test('other unevaluated validation keywords are reported when they change', () => {
+  const keywords = {
+    format: ['date-time', 'date'],
+    multipleOf: [1, 5],
+    uniqueItems: [false, true],
+    minProperties: [1, 3],
+    maxProperties: [10, 2],
+    readOnly: [false, true],
+    const: ['a', 'b'],
+  };
+  for (const [keyword, [before, after]] of Object.entries(keywords)) {
+    const result = compareSpecifications(
+      withRequestProperty('name', { [keyword]: before }),
+      withRequestProperty('name', { [keyword]: after }),
+    );
+    assert.ok(
+      result.notices.some(f => f.code === 'CONSTRAINT_NOT_COMPARED' && f.message.includes(`\`${keyword}\` changed`)),
+      `${keyword} should raise a notice`,
+    );
+    assert.deepEqual(result.breaking, [], `${keyword} should not be guessed at`);
+  }
+});
+
+test('a changed additionalProperties subschema is reported as a notice', () => {
+  const before = base(), after = base();
+  requestSchema(before).additionalProperties = { type: 'string' };
+  requestSchema(after).additionalProperties = { type: 'integer' };
+  const result = compareSpecifications(before, after);
+  assert.deepEqual(result.breaking, []);
+  assert.ok(result.notices.some(f =>
+    f.code === 'CONSTRAINT_NOT_COMPARED' && /additionalProperties` subschema changed/.test(f.message)));
+});
+
+test('constraint notices do not fire for a closed object already reported as breaking', () => {
+  const before = base(), after = base();
+  requestSchema(after).additionalProperties = false;
+  const result = compareSpecifications(before, after);
+  assert.deepEqual(result.breaking.map(f => f.code), ['REQUEST_OBJECT_CLOSED']);
+  assert.deepEqual(result.notices, []);
+});
+
+test('zero-valued constraints are real bounds, not absent ones', () => {
+  assert.ok(requestChange('name', arrayProperty({ maxItems: 5 }), arrayProperty({ maxItems: 0 }))
+    .includes('REQUEST_ITEM_COUNT_NARROWED'));
+  assert.ok(responseChange('name', arrayProperty({ maxItems: 0 }), arrayProperty({ maxItems: 5 }))
+    .includes('RESPONSE_ITEM_COUNT_WIDENED'));
+  assert.ok(requestChange('name', { maxLength: 5 }, { maxLength: 0 }).includes('REQUEST_LENGTH_NARROWED'));
+  assert.ok(numericResponseChange({ exclusiveMinimum: 0 }, { minimum: 0 }).includes('RESPONSE_RANGE_WIDENED'));
+  assert.deepEqual(requestChange('age', { exclusiveMinimum: 0 }, { exclusiveMinimum: 0 }), []);
+});
+
+test('a 3.0 document migrating to the 3.1 exclusive form reports nothing', () => {
+  const before = base(), after = base();
+  before.openapi = '3.0.3';
+  after.openapi = '3.1.0';
+  Object.assign(requestSchema(before).properties.age, { minimum: 1, maximum: 10, exclusiveMinimum: true, exclusiveMaximum: true });
+  Object.assign(requestSchema(after).properties.age, { exclusiveMinimum: 1, exclusiveMaximum: 10 });
+  const result = compareSpecifications(before, after);
+  assert.deepEqual(result.breaking, []);
+  assert.deepEqual(result.notices, []);
+});
+
+test('a 3.1 document migrating to the 3.0 boolean form reports nothing', () => {
+  const before = base(), after = base();
+  Object.assign(responseSchema(before).properties.id, { type: 'number', exclusiveMaximum: 10 });
+  Object.assign(responseSchema(after).properties.id, { type: 'number', maximum: 10, exclusiveMaximum: true });
+  assert.deepEqual(compareSpecifications(before, after).breaking, []);
+});
