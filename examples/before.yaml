@@ -21,7 +21,7 @@ paths:
                 required: [total]
                 properties:
                   total:
-                    type: integer
+                    type: string
                   currency:
                     type: string
     post:
