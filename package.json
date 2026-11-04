@@ -1,0 +1,27 @@
+{
+  "name": "contractguard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Detect potentially breaking changes between OpenAPI specifications",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "cli": "tsx src/cli.ts",
+    "test": "tsc -p tsconfig.core.json && node --test test/*.test.cjs",
+    "typecheck": "tsc --noEmit",
+    "build": "ncc build src/action.ts -o dist"
+  },
+  "dependencies": {
+    "@actions/core": "^2.0.3",
+    "@actions/github": "^8.0.1",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@vercel/ncc": "^0.38.4",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

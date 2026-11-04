@@ -1,0 +1,42 @@
+openapi: 3.0.3
+info:
+  title: Sample Store API
+  version: 1.0.0
+paths:
+  /orders:
+    get:
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Orders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [total]
+                properties:
+                  total:
+                    type: integer
+                  currency:
+                    type: string
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [itemId]
+              properties:
+                itemId:
+                  type: string
+                coupon:
+                  type: string
+      responses:
+        '201':
+          description: Created

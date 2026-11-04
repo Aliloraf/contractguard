@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Intermediate TypeScript output (test build only)
+.build/
+*.tsbuildinfo
+
+# NOTE: dist/ is intentionally NOT ignored.
+# The published GitHub Action runs the bundled dist/index.js, so it must be committed.
+
+# Test and coverage output
+coverage/
+.nyc_output/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# Generated reports and temporary files
+report.md
+*.log
+npm-debug.log*
+tmp/
+.tmp/
+*.tgz
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+*.swp

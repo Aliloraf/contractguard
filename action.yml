@@ -1,0 +1,24 @@
+name: ContractGuard
+branding:
+  icon: shield
+  color: blue
+description: Detect potentially breaking OpenAPI changes in pull requests.
+inputs:
+  spec-path:
+    description: Relative path to the OpenAPI YAML or JSON document.
+    required: true
+  comment:
+    description: Post or update a pull request comment (requires permission).
+    required: false
+    default: 'false'
+  github-token:
+    description: GITHUB_TOKEN used for optional PR comments.
+    required: false
+outputs:
+  breaking-count:
+    description: Number of detected breaking changes.
+  breaking:
+    description: Whether at least one breaking change was detected.
+runs:
+  using: node24
+  main: dist/index.js
