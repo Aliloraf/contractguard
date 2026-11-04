@@ -24,6 +24,9 @@ paths:
                     type: integer
                   currency:
                     type: string
+                  createdAt:
+                    type: string
+                    format: date-time
     post:
       requestBody:
         required: true
