@@ -9,7 +9,7 @@
   },
   "scripts": {
     "cli": "tsx src/cli.ts",
-    "test": "tsc -p tsconfig.core.json && node --test test/*.test.cjs",
+    "test": "tsc -p tsconfig.core.json && tsc -p tsconfig.json && node --test test/*.test.cjs",
     "typecheck": "tsc --noEmit",
     "build": "ncc build src/action.ts -o dist"
   },

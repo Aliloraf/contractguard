@@ -1,5 +1,11 @@
 import type { ComparisonResult, Finding } from './types';
 
+/**
+ * Marks a report so an earlier pull request comment can be found and updated
+ * instead of a second one being posted.
+ */
+export const REPORT_MARKER = '<!-- contractguard-report -->';
+
 function escapeCell(text: string): string {
   return text.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
 }
@@ -14,7 +20,7 @@ function table(findings: Finding[], changeHeading: string): string[] {
 
 export function renderMarkdown(result: ComparisonResult): string {
   const lines = [
-    '<!-- contractguard-report -->',
+    REPORT_MARKER,
     '# ContractGuard API compatibility report',
     '',
     `Checked **${result.checkedOperations}** previously documented operations.`,

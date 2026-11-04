@@ -198,7 +198,10 @@ check and **do not** change the CLI exit code; they tell you where a human still
   commits, so a spec that did not exist at the PR base commit makes the step fail with a
   `git show` error rather than being treated as "no prior contract".
 - **Events other than `pull_request`** — the Action exits with an error on `push`,
-  `workflow_dispatch`, etc. Use the CLI for those cases.
+  `workflow_dispatch`, etc., and refuses `pull_request_target` outright. Use the CLI for
+  those cases.
+- **Specifications generated during the build** — `spec-path` is read from the checkout as it
+  stands when the step runs; nothing is generated or fetched.
 - **Boolean schemas** (`items: true`, `additionalProperties: true`) are read as
   unconstrained rather than evaluated as JSON Schema booleans.
 
@@ -260,28 +263,68 @@ npm run cli -- --base /tmp/base.yaml --head openapi.yaml
 
 ## GitHub Action
 
-The Action is a bundled JavaScript action (`runs.using: node24`, entry point
-`dist/index.js`). `dist/index.js` is **committed to the repository** so consumers never
-have to install dependencies; run `npm run build` and commit the result whenever `src/`
-or a dependency changes. CI fails if the committed bundle is stale.
+A bundled JavaScript action (`runs.using: node24`, entry point `dist/index.js`).
+`dist/index.js` is **committed to the repository**, so consumers never install dependencies;
+run `npm run build` and commit the result whenever `src/` or a dependency changes. CI fails
+if the committed bundle is stale.
+
+### What it compares
+
+On a `pull_request` event ContractGuard reads the specification from the checkout and compares
+it against the same path in Git history. The baseline is the common ancestor of the base
+branch and **the commit that is actually checked out** — `git merge-base <base-sha> HEAD` —
+which is what makes both checkout styles correct:
+
+| Checkout | Working tree holds | Baseline | The report answers |
+| --- | --- | --- | --- |
+| Default (GitHub's synthetic merge commit) | base branch + this pull request, merged | the base commit, since it is already an ancestor of HEAD | "what will this API look like once this merges" |
+| `ref: ${{ github.event.pull_request.head.sha }}` | only this pull request's commits | the point where the branch diverged | "what did this pull request change" |
+
+Either way, a commit pushed to the base branch after the pull request opened is never
+attributed to the pull request. The chosen baseline is logged in the step output.
+
+If that common ancestor cannot be found — almost always a clone too shallow to contain the
+shared history — the step **fails with guidance naming `fetch-depth: 0`**. ContractGuard never
+falls back to a different commit, because measuring against the wrong baseline can report
+changes a pull request did not make, or miss ones it did.
+
+### Requirements
+
+- **Event:** `pull_request`. Any other event is a clear error, and `pull_request_target` is
+  refused outright (see [Security](#security-notes)). Use the CLI outside pull requests.
+- **Checkout:** `fetch-depth: 0`, or any depth that includes the base commit. A shallow clone
+  produces an explicit error naming `fetch-depth`, never a pass.
+- **Permissions:** `contents: read` is enough for the job summary. `pull-requests: write` is
+  needed *only* for `comment: 'true'`.
 
 ### Inputs
 
 | Input | Required | Default | Description |
 | --- | --- | --- | --- |
-| `spec-path` | yes | — | Repository-relative path to the OpenAPI YAML/JSON document. Absolute paths and paths outside the checkout are rejected. |
-| `comment` | no | `false` | Post (or update) a sticky pull request comment with the report. |
-| `github-token` | no | — | Token used for commenting; required when `comment` is `true`. |
+| `spec-path` | yes | — | Repository-relative path to the OpenAPI 3.0/3.1 YAML or JSON document. Absolute paths, paths outside the checkout, and paths containing NUL are rejected. Paths with spaces or shell metacharacters are safe: Git is invoked with an explicit argument list and no shell. |
+| `comment` | no | `false` | Post or update a sticky pull request comment with the report. Must be `true` or `false`. |
+| `github-token` | no | — | Token for the optional comment. Required when `comment` is `true`; without it the comment is skipped with a warning. |
 
 ### Outputs
 
 | Output | Description |
 | --- | --- |
+| `breaking` | `"true"` / `"false"` — whether any breaking change was detected. |
 | `breaking-count` | Number of detected breaking changes. |
-| `breaking` | `true` / `false` — whether any breaking change was detected. |
+| `notice-count` | Number of places that could not be evaluated and need a manual review. Never fails the check on its own. |
 
-The step fails when at least one breaking change is detected, and the report is always
-written to the job summary.
+### Results
+
+| Situation | Check | Reported |
+| --- | --- | --- |
+| No breaking changes | **passes** | Report in the job summary |
+| Breaking changes detected | **fails** | Report in the job summary, plus `breaking-count` |
+| Review notices only | **passes** | Report in the job summary **and a step warning**, so a passing check never silently claims full compatibility |
+| Breaking changes and notices | **fails** | Both, in the same report |
+| Specification missing at the base commit, missing from the checkout, invalid, or unreadable | **fails** | An explained error. A failure is never reported as compatible |
+
+The report is always written to the job summary; a job summary that cannot be written
+degrades to a warning rather than losing the result.
 
 ### Example workflow
 
@@ -293,14 +336,25 @@ on:
       - 'openapi.yaml'
 permissions:
   contents: read
-  pull-requests: write # only needed when comment: 'true'
 jobs:
   compatibility:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0 # required: the base commit must be available locally
+          fetch-depth: 0 # required: the base commit must be readable locally
+      - uses: YOUR_USERNAME/contractguard@v1
+        with:
+          spec-path: openapi.yaml
+```
+
+To add a sticky pull request comment, grant the extra permission and pass a token:
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write # only for comment: 'true'
+# ...
       - uses: YOUR_USERNAME/contractguard@v1
         with:
           spec-path: openapi.yaml
@@ -308,12 +362,65 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-`fetch-depth: 0` (or any depth that includes the PR base commit) is required, because the
-Action reads the previous contract with `git show <base-sha>:<spec-path>`.
+Repeated runs **update the same comment** rather than adding one per push. A comment is only
+edited when it carries ContractGuard's report marker **and** was written by the account the
+configured token acts as, resolved from the API (`GET /user`) for a personal access token, or
+assumed to be `github-actions[bot]` when the API declines to name it, which is what the default
+`GITHUB_TOKEN` does. The marker alone is never enough: anyone who can comment on a pull request
+could paste it, and ContractGuard will not edit a comment it cannot show it owns. Such comments
+are left untouched and reported as a warning, and the report is posted as a new comment.
 
-For pull requests from forks, `GITHUB_TOKEN` is read-only: ContractGuard still writes the
-job summary and fails the check, and commenting is skipped with a warning.
-**Do not switch to `pull_request_target` just to gain comment permissions.**
+One consequence worth knowing: if you supply an installation token for a GitHub App other than
+Actions, its own account cannot be determined, so each run posts a new comment instead of
+updating the previous one. Use `GITHUB_TOKEN` or a personal access token for in-place updates.
+
+### Forks and token permissions
+
+For a pull request from a fork, `GITHUB_TOKEN` is read-only. ContractGuard still writes the
+job summary, still sets its outputs and still fails the check on a breaking change; only the
+comment is skipped, with a warning that names the fork case. A comment that cannot be posted
+— for any reason, including API errors — is always a warning and never changes or conceals the
+compatibility result.
+
+This repository's own `.github/workflows/integration.yml` runs the Action with
+`uses: ./` on a tracked example specification, with `contents: read` and no secrets.
+
+### Troubleshooting
+
+| Message | Cause and fix |
+| --- | --- |
+| `The base commit … is not in the local clone` | Shallow checkout. Add `fetch-depth: 0` to `actions/checkout`. |
+| `Could not find a common ancestor of the base commit … and the checked-out commit …` | The clone lacks the shared history (or the branches are unrelated). Add `fetch-depth: 0`. No baseline is guessed. |
+| `Ignoring N comment(s) that carry the ContractGuard marker but were written by …` | Someone else's comment contains the report marker. ContractGuard left it alone and posted its own comment. Nothing to fix. |
+| `Could not establish which account the token posts as` | The identity lookup failed, so no comment was edited and a new one was posted. Usually transient. |
+| `… does not exist at the merge base …` | The specification is new in this pull request, so there is no baseline. Merge a baseline to the base branch first, or skip the step for that change. |
+| `The specification … is missing from the checkout` | `spec-path` is wrong, or the file is generated after this step runs. |
+| `ContractGuard runs on pull_request events only` | The workflow triggers on something else. Use `pull_request`, or the CLI. |
+| `ContractGuard does not run on pull_request_target` | Intentional. Switch the trigger to `pull_request`. |
+| `No Git repository was found in the workspace` | `actions/checkout` has not run yet in this job. |
+| `The specification from … could not be read` | Not a valid OpenAPI 3.0/3.1 document, or duplicate YAML keys. The message names which side failed. |
+| `comment: true needs a github-token` | Pass `github-token` and grant `pull-requests: write`. |
+| `spec-path must be relative to the repository` | Use a repository-relative path, not an absolute one. |
+
+### Manually verifying a real pull request
+
+Automated tests cover the integration with temporary repositories and mocked APIs, but the
+end-to-end behaviour on GitHub is worth confirming once per release:
+
+1. **Compatible change.** On a branch off `main`, add an optional property to
+   `examples/before.yaml` (for example `description: { type: string }` under the `/orders`
+   `get` 200 response properties) and open a pull request. The *Action integration* check
+   should pass, and its job summary should report no breaking changes.
+2. **Breaking change.** On another branch, delete the `currency` property from the same
+   response, or change `total` to `type: string`, and open a pull request. The check should
+   **fail**, and the job summary should list `RESPONSE_FIELD_REMOVED` (or
+   `SCHEMA_TYPE_CHANGED`) with the exact location.
+3. **Comment (optional).** Add `comment: 'true'`, `github-token: ${{ secrets.GITHUB_TOKEN }}`
+   and `pull-requests: write` to a workflow on a branch in this repository, then push twice.
+   The first push posts one comment; the second updates it in place rather than adding a
+   second one.
+4. **Fork behaviour (optional).** Open the same pull request from a fork with commenting
+   enabled. The check result must be identical, with a warning that the comment was skipped.
 
 ---
 
@@ -323,9 +430,28 @@ job summary and fails the check, and commenting is skipped with a warning.
   does not execute anything from the changed repository.
 - Remote/external `$ref` pointers are rejected, so no network requests are made while
   resolving a specification.
-- `spec-path` is constrained to the checked-out workspace.
-- Prefer `pull_request` over the privileged `pull_request_target` event for untrusted
-  changes.
+- **No shell is ever involved.** Git runs through `spawnSync` with an explicit argument list
+  and `shell: false`, so nothing in a path, ref or other input can be interpreted as a
+  command. A specification at `my api $(touch pwned).yaml` is read as a filename, and a
+  regression test asserts that no command substitution takes place.
+- `spec-path` is validated before use: it must be relative, free of NUL, and resolve inside
+  the repository root as reported by Git (not merely inside the working directory).
+- Commit SHAs from the event payload are matched against `^[0-9a-f]{7,64}$` before being
+  passed to Git.
+- **`pull_request_target` is refused.** That event hands a writable token to a workflow
+  inspecting untrusted changes, and its checkout is the base branch, so the comparison would
+  compare the base against itself and silently pass. ContractGuard fails with an explanation
+  instead. Use `pull_request`, where the token is read-only for forks.
+- **A comment is only edited when ContractGuard can show it owns it**: the report marker and
+  the author must both match the account the token acts as. The marker is not a capability —
+  any pull request participant can paste it — so marker-only matching would let an unrelated
+  comment be overwritten on every run. Ownership that cannot be established means a new
+  comment, never an edit.
+- **No baseline fallback.** If the common ancestor of the base commit and HEAD cannot be
+  found, the step fails with guidance rather than measuring against another commit, because a
+  silently substituted baseline can turn a breaking change into a pass.
+- Commenting is opt-in, needs an explicitly passed token, and every failure to comment is a
+  warning — it can never conceal or alter the compatibility result.
 
 ## Roadmap
 
@@ -334,7 +460,8 @@ job summary and fails the check, and commenting is skipped with a warning.
    `allOf` merging, provable `anyOf`/`oneOf` cases, explicit review-required notices
    *(current)*; still to come: `anyOf`/`oneOf` subsumption analysis, broader third-party
    fixtures.
-3. **v0.3** — inline PR annotations, ignore/config rules, JSON diff export, multi-file `$ref`.
+3. **v0.3** — inline PR annotations, ignore/config rules, JSON diff export, multi-file `$ref`,
+   multiple specification paths per run.
 4. **v1.0** — full compatibility suite, published versioned Action, example repositories.
 
 ## License
