@@ -35,6 +35,12 @@ Every finding carries a stable rule code:
 | `RESPONSE_ENUM_EXPANDED` | A response `enum` gained values, or lost its `enum` constraint entirely — deployed clients may not handle the new values. |
 | `REQUEST_FIELD_REQUIRED` | A request-side property (request body or object-typed parameter) became newly required. |
 | `REQUEST_OBJECT_CLOSED` | A request object that accepted undeclared properties is now `additionalProperties: false`. |
+| `REQUEST_RANGE_NARROWED` | A request's numeric range tightened (`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`). |
+| `RESPONSE_RANGE_WIDENED` | A response's numeric range relaxed, so it may return values outside the documented range. |
+| `REQUEST_LENGTH_NARROWED` | A request's `minLength`/`maxLength` window tightened. |
+| `RESPONSE_LENGTH_WIDENED` | A response's `minLength`/`maxLength` guarantee relaxed. |
+| `REQUEST_ITEM_COUNT_NARROWED` | A request array's `minItems`/`maxItems` window tightened. |
+| `RESPONSE_ITEM_COUNT_WIDENED` | A response array's `minItems`/`maxItems` guarantee relaxed. |
 | `REQUEST_FIELD_REMOVED` | A property was dropped from a request schema with `additionalProperties: false`. |
 | `RESPONSE_FIELD_REMOVED` | A `2xx` response property was removed. |
 | `RESPONSE_FIELD_OPTIONAL` | A previously guaranteed (`required`) response property is now optional. |
@@ -59,6 +65,21 @@ Schema handling details:
   and items. Adding `type: object` to a request schema that previously declared only
   `properties` therefore *is* breaking — an untyped schema also accepted strings and numbers
   — and a response that drops its declared type may now return anything.
+- **Validation constraints are compared as value ranges.** Tightening a request bound and
+  relaxing a response bound are both breaking; the reverse of either is compatible. Adding a
+  constraint tightens, removing one relaxes, and an absent `minLength`/`minItems` is read as
+  `0` while an absent `maxLength`/`maxItems` is read as unbounded, so writing out
+  `minLength: 0` is not a change.
+- **Both exclusive-bound dialects are understood.** OpenAPI 3.0's boolean
+  `exclusiveMinimum: true` alongside `minimum: 5` and OpenAPI 3.1's numeric
+  `exclusiveMinimum: 5` are treated as the same bound, so migrating between the two reports
+  nothing. When a schema carries both `minimum` and a numeric `exclusiveMinimum`, the
+  stricter of the two wins. On an `integer`-only schema an exclusive bound is snapped to the
+  equivalent inclusive one, so `exclusiveMinimum: 4` and `minimum: 5` compare equal.
+- **A constraint is only compared where it can bite.** Each keyword applies to the instance
+  types it constrains, so `minLength` on a pair of schemas both declared `number` is inert
+  and ignored. When neither side declares a type, any instance is possible and the keyword is
+  compared. This asks what a keyword constrains and never infers a type from it.
 - **Internal JSON pointers** (`$ref: '#/components/...'`) are resolved for path items,
   operations, parameters, request bodies, responses and schemas, including the `~0`/`~1`
   escapes, and each side resolves against its own document.
@@ -77,6 +98,7 @@ check and **do not** change the CLI exit code; they tell you where a human still
 | `UNSUPPORTED_TUPLE_ITEMS` | `prefixItems` (3.1 tuple validation) is present and is not evaluated. |
 | `SCHEMA_NOT_COMPARED` | One side of a pair declares a schema and the other does not (media type, array `items`, parameter), or a parameter uses `content` serialisation. |
 | `SECURITY_NOT_COMPARED` | The operation's effective `security` requirements changed; authentication compatibility is not analysed. |
+| `CONSTRAINT_NOT_COMPARED` | A validation keyword that cannot be evaluated reliably changed: `pattern`, `format`, `multipleOf`, `uniqueItems`, `contains`/`minContains`/`maxContains`, `minProperties`/`maxProperties`, `patternProperties`, `propertyNames`, `dependentRequired`/`dependentSchemas`, `const`, `readOnly`/`writeOnly`, `unevaluatedProperties`/`unevaluatedItems`, or an `additionalProperties` subschema. Unchanged keywords stay quiet, since they cannot affect compatibility. |
 
 ## What the engine does **not** support
 
@@ -89,10 +111,13 @@ check and **do not** change the CLI exit code; they tell you where a human still
 - **`security` scheme semantics** — a change is flagged via `SECURITY_NOT_COMPARED`, but
   scopes and scheme types are not analysed.
 - **Non-`2xx` responses** — error responses and response headers are not compared.
-- **Schema constraints** beyond type, `enum`, `required`, `properties`, `items` and
-  `additionalProperties: false`: `format`, `pattern`, `minimum`/`maximum`, `minLength`,
-  `minItems`/`maxItems`, `uniqueItems`, `patternProperties`, `readOnly`/`writeOnly`,
-  `default` and `const` are ignored.
+- **Constraints that need instance-level or language-level reasoning** are not evaluated:
+  `pattern` (no regular expression inclusion analysis is attempted), `format`, `multipleOf`,
+  `uniqueItems`, `contains`, `minProperties`/`maxProperties`, `patternProperties`,
+  `propertyNames`, `dependentRequired`, `const` and `readOnly`/`writeOnly`. A change to any
+  of them raises `CONSTRAINT_NOT_COMPARED` instead of being treated as compatible.
+- **Annotation keywords** (`default`, `title`, `description`, `example`, `deprecated`) are
+  ignored entirely, including for notices.
 - **`servers`, `webhooks`, `callbacks`, `links`, `style`/`explode`** and OpenAPI document
   validation in general — ContractGuard only checks that `openapi` is `3.0.x`/`3.1.x` and
   that `paths` is an object.
@@ -104,8 +129,6 @@ check and **do not** change the CLI exit code; they tell you where a human still
   `workflow_dispatch`, etc. Use the CLI for those cases.
 - **Boolean schemas** (`items: true`, `additionalProperties: true`) are read as
   unconstrained rather than evaluated as JSON Schema booleans.
-- **`additionalProperties: false` on a schema with no declared `type` and no `properties`**
-  is not reported, since there is nothing to show it constrains objects.
 
 ---
 
