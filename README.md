@@ -6,63 +6,106 @@ ContractGuard compares two OpenAPI 3.0/3.1 documents and reports potentially bre
 changes. It runs locally as a CLI and as a GitHub Action that annotates pull requests
 with a Markdown report and fails the check when breaking changes are found.
 
-> **Status: v0.1 (MVP).** The rule set is deliberately small and conservative.
-> ContractGuard is **not** a complete OpenAPI compatibility checker, and a clean report
-> is not a guarantee of backward compatibility.
+> **Status: early development.** The rule set is deliberately small, conservative and
+> directional. ContractGuard is **not** a complete OpenAPI compatibility checker; a clean
+> report is not a guarantee of backward compatibility, and anything the engine cannot
+> evaluate is listed explicitly as a review-required notice rather than passed over.
 
 ---
 
-## What the MVP detects
+## What the comparison engine detects
 
-Every finding is reported with a stable rule code:
+Comparison is **directional**, which is what keeps the rules precise: a request schema may
+only become *more* permissive, and a response schema may only become *more* restrictive.
+Adding an optional request field or a new response field is therefore compatible, while the
+same change in the opposite direction is reported.
+
+Every finding carries a stable rule code:
 
 | Rule code | Detected change |
 | --- | --- |
 | `OPERATION_REMOVED` | A documented path + method is gone (or its whole path is gone). |
 | `SUCCESS_RESPONSE_REMOVED` | A documented `2xx` status code is gone from an operation. |
 | `PARAMETER_REMOVED` | A path-level or operation-level parameter (`in` + `name`) is gone. |
-| `PARAMETER_REQUIRED` | A parameter that was optional (or new) is now `required: true`. |
+| `PARAMETER_REQUIRED` | A parameter that was optional (or new) is now required. Path parameters count as required even when `required: true` is omitted. |
 | `REQUEST_BODY_REQUIRED` | An operation's request body became `required: true`. |
 | `MEDIA_TYPE_REMOVED` | A request or `2xx` response media type is no longer offered. |
-| `SCHEMA_TYPE_CHANGED` | A schema's `type` changed (nested objects and array `items` included). |
-| `REQUEST_ENUM_NARROWED` | Values were removed from a request-side `enum` (parameter or request body schema). |
+| `SCHEMA_TYPE_CHANGED` | A request no longer accepts a type it used to, or a response may now return a type it previously could not (`integer` counts as a `number`). Also covers a request gaining, or a response losing, its type constraint. |
+| `REQUEST_ENUM_NARROWED` | Values were removed from a request-side `enum`, or an `enum` was introduced where the value was previously unconstrained. |
+| `RESPONSE_ENUM_EXPANDED` | A response `enum` gained values, or lost its `enum` constraint entirely — deployed clients may not handle the new values. |
 | `REQUEST_FIELD_REQUIRED` | A request-side property (request body or object-typed parameter) became newly required. |
+| `REQUEST_OBJECT_CLOSED` | A request object that accepted undeclared properties is now `additionalProperties: false`. |
 | `REQUEST_FIELD_REMOVED` | A property was dropped from a request schema with `additionalProperties: false`. |
 | `RESPONSE_FIELD_REMOVED` | A `2xx` response property was removed. |
 | `RESPONSE_FIELD_OPTIONAL` | A previously guaranteed (`required`) response property is now optional. |
 
-Comparison is **directional**: a newly required *request* field is breaking, while a newly
-added *response* field is not. Type changes are flagged in both directions.
+Rules apply at every depth: nested objects, array elements (reported as `path[]`), parameter
+schemas and request/response bodies, with locations such as
+`GET /orders 200 response [application/json].items[].price`.
 
-Also supported:
+Schema handling details:
 
-- Internal JSON pointers (`$ref: '#/components/...'`) for path items, operations,
-  parameters, request bodies, responses and schemas, including JSON-pointer escapes
-  (`~0`, `~1`).
-- Recursive (self-referencing) schemas, via cycle tracking during the walk.
-- YAML and JSON specs, with duplicate-key detection in YAML.
+- **Type sets are compared, not type strings.** OpenAPI 3.0 `nullable: true` is folded into
+  the type set, so `type: string, nullable: true` and 3.1's `type: ['string', 'null']` are
+  treated identically. Narrowing `['string','null']` to `string` in a *response* is
+  compatible; the same change in a *request* is breaking.
+- **`integer` is treated as a subset of `number`.** A request widening `integer` to `number`
+  and a response narrowing `number` to `integer` are both compatible; the reverse of either
+  is breaking. This holds inside union types too, so `['integer','number']` and `number`
+  accept exactly the same values.
+- **Structural keywords never imply a type.** `properties`, `required`, `items` and
+  `prefixItems` only constrain instances that already are objects or arrays, so a schema
+  without `type` is treated as unconstrained and is still compared through its properties
+  and items. Adding `type: object` to a request schema that previously declared only
+  `properties` therefore *is* breaking — an untyped schema also accepted strings and numbers
+  — and a response that drops its declared type may now return anything.
+- **Internal JSON pointers** (`$ref: '#/components/...'`) are resolved for path items,
+  operations, parameters, request bodies, responses and schemas, including the `~0`/`~1`
+  escapes, and each side resolves against its own document.
+- **Recursive (self-referencing) schemas** terminate via pair-wise cycle tracking.
+- YAML and JSON specs are both accepted, with duplicate-key detection in YAML.
 
-## What the MVP does **not** support
+## Review-required notices
+
+Silently skipping a construct the engine cannot evaluate would make a clean report
+misleading, so those places are reported separately as notices. Notices **do not** fail the
+check and **do not** change the CLI exit code; they tell you where a human still has to look.
+
+| Notice code | Meaning |
+| --- | --- |
+| `UNSUPPORTED_COMPOSITION` | `allOf`, `oneOf`, `anyOf` or `not` is present at a compared position and is not evaluated. |
+| `UNSUPPORTED_TUPLE_ITEMS` | `prefixItems` (3.1 tuple validation) is present and is not evaluated. |
+| `SCHEMA_NOT_COMPARED` | One side of a pair declares a schema and the other does not (media type, array `items`, parameter), or a parameter uses `content` serialisation. |
+| `SECURITY_NOT_COMPARED` | The operation's effective `security` requirements changed; authentication compatibility is not analysed. |
+
+## What the engine does **not** support
 
 - **External or multi-file `$ref`** — any `$ref` that does not start with `#/` is rejected
   with an error (deliberate: it avoids network fetches on untrusted input).
-- **`allOf` / `oneOf` / `anyOf` / `not` / `discriminator`** — composition keywords are not
-  merged or compared, so changes inside them are invisible to the current rules.
+- **`allOf` / `oneOf` / `anyOf` / `not` / `discriminator` semantics** — composition is not
+  merged or evaluated. Its presence raises `UNSUPPORTED_COMPOSITION` rather than being
+  ignored, but changes *inside* a composed subschema are not compared.
+- **`prefixItems` / tuple validation** — flagged via `UNSUPPORTED_TUPLE_ITEMS`, not compared.
+- **`security` scheme semantics** — a change is flagged via `SECURITY_NOT_COMPARED`, but
+  scopes and scheme types are not analysed.
 - **Non-`2xx` responses** — error responses and response headers are not compared.
-- **Schema constraints** beyond `type`, `required`, `properties`, `items` and request-side
-  `enum`: `format`, `pattern`, `minimum`/`maximum`, `minLength`, `nullable`,
-  `additionalProperties` schemas, `readOnly`/`writeOnly` and defaults are ignored.
-- **`security`, `servers`, `webhooks`, `callbacks`, `links`, `parameter.content`,
-  `style`/`explode`** and OpenAPI document validation in general — ContractGuard only
-  checks that `openapi` is `3.0.x`/`3.1.x` and that `paths` is an object.
+- **Schema constraints** beyond type, `enum`, `required`, `properties`, `items` and
+  `additionalProperties: false`: `format`, `pattern`, `minimum`/`maximum`, `minLength`,
+  `minItems`/`maxItems`, `uniqueItems`, `patternProperties`, `readOnly`/`writeOnly`,
+  `default` and `const` are ignored.
+- **`servers`, `webhooks`, `callbacks`, `links`, `style`/`explode`** and OpenAPI document
+  validation in general — ContractGuard only checks that `openapi` is `3.0.x`/`3.1.x` and
+  that `paths` is an object.
 - **Added paths/operations** are never reported (they are additive by definition).
 - **Renamed or newly added spec files** — the Action compares the *same path* across
   commits, so a spec that did not exist at the PR base commit makes the step fail with a
   `git show` error rather than being treated as "no prior contract".
 - **Events other than `pull_request`** — the Action exits with an error on `push`,
   `workflow_dispatch`, etc. Use the CLI for those cases.
-- **JSON Schema 2020-12 semantics** are only partially honoured (`type` arrays are
-  normalised, nothing more).
+- **Boolean schemas** (`items: true`, `additionalProperties: true`) are read as
+  unconstrained rather than evaluated as JSON Schema booleans.
+- **`additionalProperties: false` on a schema with no declared `type` and no `properties`**
+  is not reported, since there is nothing to show it constrains objects.
 
 ---
 
@@ -107,7 +150,7 @@ The report is printed to stdout. Exit codes:
 
 | Code | Meaning |
 | --- | --- |
-| `0` | No breaking changes found by the current rule set. |
+| `0` | No breaking changes found by the current rule set (review-required notices do not change this). |
 | `1` | At least one potentially breaking change found. |
 | `2` | Invalid usage, unreadable file, or an unsupported/invalid specification. |
 
@@ -191,8 +234,10 @@ job summary and fails the check, and commenting is skipped with a warning.
 
 ## Roadmap
 
-1. **v0.1** — comparison engine, CLI, bundled GitHub Action, unit tests *(current)*.
-2. **v0.2** — `allOf`/`oneOf`/`anyOf` handling, more schema constraints, broader fixtures.
+1. **v0.1** — comparison engine, CLI, bundled GitHub Action, unit tests *(done)*.
+2. **v0.2** — directional type/enum rules, `additionalProperties` and array/nested coverage,
+   explicit review-required notices *(current)*; still to come: `allOf`/`oneOf`/`anyOf`
+   evaluation, numeric/string constraints, broader third-party fixtures.
 3. **v0.3** — inline PR annotations, ignore/config rules, JSON diff export, multi-file `$ref`.
 4. **v1.0** — full compatibility suite, published versioned Action, example repositories.
 

@@ -1,7 +1,15 @@
-import type { ComparisonResult } from './types';
+import type { ComparisonResult, Finding } from './types';
 
 function escapeCell(text: string): string {
   return text.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+}
+
+function table(findings: Finding[], changeHeading: string): string[] {
+  const lines = [`| Rule | Location | ${changeHeading} |`, '| --- | --- | --- |'];
+  for (const f of findings) {
+    lines.push(`| \`${escapeCell(f.code)}\` | \`${escapeCell(f.location)}\` | ${escapeCell(f.message)} |`);
+  }
+  return lines;
 }
 
 export function renderMarkdown(result: ComparisonResult): string {
@@ -16,11 +24,13 @@ export function renderMarkdown(result: ComparisonResult): string {
     lines.push('✅ No breaking changes detected by the current rule set.');
   } else {
     lines.push(`❌ Found **${result.breaking.length}** potentially breaking changes.`, '',
-      '| Rule | Location | Change |', '| --- | --- | --- |');
-    for (const f of result.breaking) {
-      lines.push(`| \`${escapeCell(f.code)}\` | \`${escapeCell(f.location)}\` | ${escapeCell(f.message)} |`);
-    }
+      ...table(result.breaking, 'Change'));
   }
-  lines.push('', '> ContractGuard v0.1 uses a deliberately limited rule set; a passing report is not a guarantee of full backward compatibility.', '');
+  if (result.notices.length) {
+    lines.push('',
+      `⚠️ **${result.notices.length}** place(s) could not be evaluated and need a manual review.`, '',
+      ...table(result.notices, 'Not evaluated'));
+  }
+  lines.push('', '> ContractGuard uses a deliberately limited rule set; a passing report is not a guarantee of full backward compatibility.', '');
   return lines.join('\n');
 }
