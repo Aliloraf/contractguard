@@ -13,6 +13,56 @@ with a Markdown report and fails the check when breaking changes are found.
 
 ---
 
+## Quick start
+
+Add this workflow, replacing `openapi.yaml` with the path to your specification:
+
+```yaml
+# .github/workflows/api-compatibility.yml
+name: API compatibility
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # required: the base commit must be readable locally
+      - uses: Aliloraf/contractguard@v0.1.0
+        with:
+          spec-path: openapi.yaml
+```
+
+On every pull request that touches the specification, ContractGuard compares it against the
+base branch and writes a report to the job summary. The check **fails** when it finds a
+breaking change and **passes** when it does not. `contents: read` is all it needs; see
+[Requirements](#requirements) for the details and [optional PR comments](#github-action) for
+the one feature that needs more.
+
+To try it locally against two files, without GitHub:
+
+```bash
+git clone https://github.com/Aliloraf/contractguard.git
+cd contractguard && npm ci
+npm run cli -- --base examples/before.yaml --head examples/after.yaml
+```
+
+### At a glance
+
+| | |
+| --- | --- |
+| **Catches** | removed operations, parameters, success responses and media types; newly required parameters, bodies and fields; request enums narrowed; response enums widened; numeric, length and item-count ranges tightened for requests or relaxed for responses; objects closed to extra properties; response fields removed or made optional; type changes, directionally, with `integer` understood as part of `number` |
+| **Understands** | OpenAPI 3.0 and 3.1, YAML and JSON, internal `$ref` (including recursion), nested objects and arrays, and `allOf` wherever it can be merged without changing meaning |
+| **Reports for review instead of guessing** | `anyOf`/`oneOf` changes whose effect depends on overlapping alternatives, `allOf` that cannot be merged safely, `pattern`, `format`, `multipleOf` and other constraints needing instance-level reasoning, and changed `security` requirements |
+| **Does not check** | external or multi-file `$ref`, non-`2xx` responses, response headers, `servers`, `webhooks`, `callbacks`, or anything else in [the limitations](#what-the-engine-does-not-support) |
+
+A clean report is not a proof of compatibility. Everything the engine cannot evaluate is
+listed explicitly as a review-required notice rather than passed over in silence.
+
+---
+
 ## What the comparison engine detects
 
 Comparison is **directional**, which is what keeps the rules precise: a request schema may
@@ -212,7 +262,7 @@ check and **do not** change the CLI exit code; they tell you where a human still
 Requirements: **Node.js 24+** and npm (the published Action runs on the `node24` runtime).
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/contractguard.git
+git clone https://github.com/Aliloraf/contractguard.git
 cd contractguard
 npm ci            # or: npm install
 ```
@@ -288,6 +338,20 @@ shared history — the step **fails with guidance naming `fetch-depth: 0`**. Con
 falls back to a different commit, because measuring against the wrong baseline can report
 changes a pull request did not make, or miss ones it did.
 
+### Pinning a version
+
+Pin a released tag, as the examples do:
+
+```yaml
+- uses: Aliloraf/contractguard@v0.1.0
+```
+
+Release tags are immutable, so a pinned workflow keeps behaving the same way. **No moving
+`v0` tag is published**: while ContractGuard is on `0.x`, a minor release may change what is
+reported, and a tag that silently moved under you could turn a passing check into a failing
+one. Update the tag deliberately when you choose to; the [CHANGELOG](CHANGELOG.md) records
+what changed. For maximum strictness, pin the commit SHA a tag points at.
+
 ### Requirements
 
 - **Event:** `pull_request`. Any other event is a clear error, and `pull_request_target` is
@@ -343,7 +407,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # required: the base commit must be readable locally
-      - uses: YOUR_USERNAME/contractguard@v1
+      - uses: Aliloraf/contractguard@v0.1.0
         with:
           spec-path: openapi.yaml
 ```
@@ -355,7 +419,7 @@ permissions:
   contents: read
   pull-requests: write # only for comment: 'true'
 # ...
-      - uses: YOUR_USERNAME/contractguard@v1
+      - uses: Aliloraf/contractguard@v0.1.0
         with:
           spec-path: openapi.yaml
           comment: 'true'

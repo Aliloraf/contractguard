@@ -3,6 +3,23 @@
   "version": "0.1.0",
   "private": true,
   "description": "Detect potentially breaking changes between OpenAPI specifications",
+  "keywords": [
+    "openapi",
+    "swagger",
+    "breaking-changes",
+    "api-compatibility",
+    "github-action",
+    "contract-testing",
+    "api-governance"
+  ],
+  "homepage": "https://github.com/Aliloraf/contractguard#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Aliloraf/contractguard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Aliloraf/contractguard/issues"
+  },
   "license": "MIT",
   "engines": {
     "node": ">=24"
