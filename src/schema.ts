@@ -4,10 +4,35 @@ import type { JsonObject } from './types';
  * Keywords that carry no validation meaning. They are dropped when schemas are
  * merged or canonicalised, so two schemas that differ only in their prose are
  * treated as the same contract.
+ *
+ * This is a set of *keywords*, and only applies where a keyword can appear:
+ * directly inside a schema object. The same strings are ordinary names when
+ * they are keys of `properties` or of any other map, and ordinary data inside
+ * `enum`, `const` and the like, where they must never be dropped.
  */
 export const ANNOTATION_KEYWORDS: ReadonlySet<string> = new Set([
   'title', 'description', 'summary', 'example', 'examples', 'default', 'deprecated',
-  '$comment', '$id', '$schema', '$anchor', 'externalDocs', 'xml', 'discriminator',
+  '$comment', '$id', '$schema', '$anchor', 'externalDocs', 'xml',
+]);
+
+/** Keywords whose value is a single subschema. */
+export const SUBSCHEMA_KEYWORDS: ReadonlySet<string> = new Set([
+  'items', 'additionalProperties', 'additionalItems', 'not', 'if', 'then', 'else',
+  'contains', 'propertyNames', 'unevaluatedProperties', 'unevaluatedItems', 'contentSchema',
+]);
+
+/** Keywords whose value is a list of subschemas. */
+export const SUBSCHEMA_LIST_KEYWORDS: ReadonlySet<string> = new Set([
+  'allOf', 'anyOf', 'oneOf', 'prefixItems',
+]);
+
+/**
+ * Keywords whose value is a map from an arbitrary name to a subschema. The keys
+ * of these maps are property names, patterns or definition names chosen by the
+ * API author, never schema keywords.
+ */
+export const SUBSCHEMA_MAP_KEYWORDS: ReadonlySet<string> = new Set([
+  'properties', 'patternProperties', 'dependentSchemas', '$defs', 'definitions',
 ]);
 
 export const NUMERIC_TYPES = ['number', 'integer'] as const;
@@ -30,10 +55,26 @@ export interface Document {
   readonly root: JsonObject;
   readonly flattened: WeakMap<JsonObject, FlattenedSchema>;
   readonly canonical: WeakMap<JsonObject, string>;
+  /**
+   * Whether keywords written beside a `$ref` constrain the instance. OpenAPI 3.0
+   * and Swagger 2.0 define them as ignored; from OpenAPI 3.1 on a schema is a
+   * JSON Schema 2020-12 schema, where they apply together with the target.
+   */
+  readonly refSiblingsApply: boolean;
+  /** The `allOf` form of each `$ref` that has sibling keywords, by identity. */
+  readonly refCompositions: WeakMap<JsonObject, JsonObject>;
 }
 
 export function documentFor(root: JsonObject): Document {
-  return { root, flattened: new WeakMap(), canonical: new WeakMap() };
+  const version = root.openapi;
+  const ignoresSiblings = 'swagger' in root || (typeof version === 'string' && /^3\.0(\.|$)/.test(version));
+  return {
+    root,
+    flattened: new WeakMap(),
+    canonical: new WeakMap(),
+    refSiblingsApply: !ignoresSiblings,
+    refCompositions: new WeakMap(),
+  };
 }
 
 export function record(value: unknown): JsonObject {
@@ -54,6 +95,19 @@ function pointerSegments(ref: string): string[] {
   return ref.slice(2).split('/').map(segment => segment.replace(/~1/g, '/').replace(/~0/g, '~'));
 }
 
+/** Follows one internal reference. */
+function dereference(root: JsonObject, ref: string): JsonObject {
+  if (!ref.startsWith('#/')) {
+    throw new Error(`Only internal OpenAPI references are supported: ${ref}`);
+  }
+  let target: unknown = root;
+  for (const key of pointerSegments(ref)) {
+    target = record(target)[key];
+    if (target === undefined) throw new Error(`Unresolved OpenAPI reference: ${ref}`);
+  }
+  return record(target);
+}
+
 export function resolve(root: JsonObject, value: unknown): JsonObject {
   let current = record(value);
   const seen = new Set<string>();
@@ -66,12 +120,45 @@ export function resolve(root: JsonObject, value: unknown): JsonObject {
       throw new Error(`Cyclic $ref alias: ${ref}`);
     }
     seen.add(ref);
-    let target: unknown = root;
-    for (const key of pointerSegments(ref)) {
-      target = record(target)[key];
-      if (target === undefined) throw new Error(`Unresolved OpenAPI reference: ${ref}`);
+    current = dereference(root, ref);
+  }
+  return current;
+}
+
+function hasConstrainingSiblings(schema: JsonObject): boolean {
+  for (const key of Object.keys(schema)) {
+    if (key !== '$ref' && !ANNOTATION_KEYWORDS.has(key)) return true;
+  }
+  return false;
+}
+
+/**
+ * Resolves a schema the way `resolve` does, but without losing keywords written
+ * beside a `$ref` where the document's dialect makes them count. Such a schema
+ * is the intersection of its target and its own keywords, so it is returned as
+ * the equivalent `allOf`, which the comparator then merges like any other. The
+ * result is memoised so the same schema always yields the same object.
+ */
+export function resolveSchema(doc: Document, value: unknown): JsonObject {
+  let current = record(value);
+  const seen = new Set<string>();
+  while (typeof current.$ref === 'string') {
+    const ref = current.$ref;
+    if (doc.refSiblingsApply && hasConstrainingSiblings(current)) {
+      let composition = doc.refCompositions.get(current);
+      if (!composition) {
+        const siblings: JsonObject = {};
+        for (const key of Object.keys(current)) {
+          if (key !== '$ref' && !ANNOTATION_KEYWORDS.has(key)) siblings[key] = current[key];
+        }
+        composition = { allOf: [{ $ref: ref }, siblings] };
+        doc.refCompositions.set(current, composition);
+      }
+      return composition;
     }
-    current = record(target);
+    if (seen.has(ref)) throw new Error(`Cyclic $ref alias: ${ref}`);
+    seen.add(ref);
+    current = dereference(doc.root, ref);
   }
   return current;
 }
@@ -260,12 +347,44 @@ export function countUpperBound(schema: JsonObject, keyword: string): Bound {
 const CANONICAL_NODE_BUDGET = 20000;
 const OVER_BUDGET = Symbol('canonical-over-budget');
 
+/** Compositions whose branches may be reordered without changing the meaning. */
+const UNORDERED_LIST_KEYWORDS: ReadonlySet<string> = new Set(['allOf', 'anyOf', 'oneOf']);
+/** Of those, the ones where repeating a branch changes nothing either. */
+const IDEMPOTENT_LIST_KEYWORDS: ReadonlySet<string> = new Set(['allOf', 'anyOf']);
+/** Count keywords for which `0` is the same as leaving the keyword out. */
+const ZERO_DEFAULT_KEYWORDS: ReadonlySet<string> = new Set(['minLength', 'minItems', 'minProperties']);
+/** Boolean keywords for which `false` is the same as leaving the keyword out. */
+const FALSE_DEFAULT_KEYWORDS: ReadonlySet<string> = new Set(['uniqueItems', 'nullable']);
+
+interface CanonicalState {
+  doc: Document;
+  /** References being expanded, innermost last. */
+  activeRefs: Set<string>;
+  /** Active references that were re-entered below their own expansion. */
+  reentered: Set<string>;
+  budget: number;
+}
+
 /**
- * Builds a stable string for a schema with every internal `$ref` expanded and
- * object keys sorted, so two schemas can be compared for equal meaning rather
- * than equal spelling. A reference that re-enters itself is replaced by a
- * marker naming the pointer, which keeps recursive schemas finite while still
- * distinguishing different targets.
+ * Builds a stable string for a schema with every internal `$ref` expanded, so
+ * two schemas can be compared for equal meaning rather than equal spelling.
+ *
+ * The walk follows the grammar of a schema instead of treating it as a bag of
+ * JSON. Annotations are dropped only where they are keywords; the keys of
+ * `properties` and the other subschema maps are names and are all kept; the
+ * values of `enum`, `const` and every keyword that is not known to hold a
+ * subschema are data, copied whole with nothing dropped and nothing expanded.
+ *
+ * Spellings that provably accept the same instances are folded together:
+ * object key order, the order of `required`, `enum`, `type` and of
+ * `allOf`/`anyOf`/`oneOf` branches, repeated `allOf`/`anyOf` branches,
+ * `nullable: true` against a `"null"` type, and keywords set to the value they
+ * have when absent. Nothing else is: when in doubt two schemas stay different,
+ * which callers report for review.
+ *
+ * A reference that re-enters itself is replaced by a marker naming the pointer,
+ * and the place it was first expanded is marked as well, so a recursive schema
+ * stays finite without two different recursions collapsing into one string.
  *
  * Returns `null` when the schema is too large to canonicalise, which callers
  * must treat as "cannot tell" rather than "equal".
@@ -278,7 +397,10 @@ export function canonicalize(doc: Document, value: unknown): string | null {
   }
   let result: string | null;
   try {
-    result = valueKey(canonicalNode(doc, value, new Set<string>(), { left: CANONICAL_NODE_BUDGET }));
+    const state: CanonicalState = {
+      doc, activeRefs: new Set(), reentered: new Set(), budget: CANONICAL_NODE_BUDGET,
+    };
+    result = valueKey(canonicalSchema(state, value));
   } catch (error) {
     if (error !== OVER_BUDGET) throw error;
     result = null;
@@ -287,45 +409,118 @@ export function canonicalize(doc: Document, value: unknown): string | null {
   return result;
 }
 
-function canonicalNode(
-  doc: Document,
-  value: unknown,
-  activeRefs: Set<string>,
-  budget: { left: number },
-): unknown {
-  if (--budget.left < 0) throw OVER_BUDGET;
+function spend(state: CanonicalState): void {
+  if (--state.budget < 0) throw OVER_BUDGET;
+}
+
+/** Plain JSON: keys sorted, nothing dropped, no reference followed. */
+function canonicalData(state: CanonicalState, value: unknown): unknown {
+  spend(state);
   if (value === null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) return value.map(item => canonicalNode(doc, item, activeRefs, budget));
+  if (Array.isArray(value)) return value.map(item => canonicalData(state, item));
+  const source = value as JsonObject;
+  const data: JsonObject = {};
+  for (const key of Object.keys(source).sort()) data[key] = canonicalData(state, source[key]);
+  return data;
+}
+
+function sortedByKey(values: unknown[], distinct: boolean): unknown[] {
+  const keyed = values.map(value => ({ key: valueKey(value), value }));
+  keyed.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  return keyed
+    .filter((entry, index) => !distinct || index === 0 || keyed[index - 1].key !== entry.key)
+    .map(entry => entry.value);
+}
+
+/** A value in schema position: an object, or the boolean schemas `true`/`false`. */
+function canonicalSchema(state: CanonicalState, value: unknown): unknown {
+  if (value === true) {
+    spend(state);
+    return {};
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return canonicalData(state, value);
+  }
+  spend(state);
 
   const schema = value as JsonObject;
   const ref = schema.$ref;
-  if (typeof ref === 'string') {
-    if (!ref.startsWith('#/')) return { $externalRef: ref };
-    if (activeRefs.has(ref)) return { $cyclicRef: ref };
-    let target: unknown = doc.root;
+  if (typeof ref !== 'string') return canonicalKeywords(state, schema, {});
+
+  let resolved: unknown;
+  if (!ref.startsWith('#/')) resolved = { $externalRef: ref };
+  else if (state.activeRefs.has(ref)) {
+    state.reentered.add(ref);
+    resolved = { $cyclicRef: ref };
+  } else {
+    let target: unknown = state.doc.root;
     for (const key of pointerSegments(ref)) {
       target = record(target)[key];
-      if (target === undefined) return { $unresolvedRef: ref };
+      if (target === undefined) break;
     }
-    activeRefs.add(ref);
-    try {
-      const resolved = canonicalNode(doc, target, activeRefs, budget);
-      const siblings = Object.keys(schema)
-        .filter(key => key !== '$ref' && !ANNOTATION_KEYWORDS.has(key))
-        .sort();
-      if (siblings.length === 0) return resolved;
-      const combined: JsonObject = { $resolved: resolved };
-      for (const key of siblings) combined[key] = canonicalNode(doc, schema[key], activeRefs, budget);
-      return combined;
-    } finally {
-      activeRefs.delete(ref);
+    if (target === undefined) resolved = { $unresolvedRef: ref };
+    else {
+      state.activeRefs.add(ref);
+      try {
+        resolved = canonicalSchema(state, target);
+      } finally {
+        state.activeRefs.delete(ref);
+      }
+      // Mark where a recursion is anchored; a cycle back to this point is not
+      // the same schema as a cycle back to somewhere else.
+      if (state.reentered.delete(ref)) resolved = { $recursiveRef: ref, $target: resolved };
     }
   }
 
-  const canonical: JsonObject = {};
+  const siblings = canonicalKeywords(state, schema, {});
+  if (Object.keys(siblings).length === 0) return resolved;
+  return { $resolved: resolved, ...siblings };
+}
+
+function canonicalKeywords(state: CanonicalState, schema: JsonObject, out: JsonObject): JsonObject {
+  const types = effectiveTypes(schema);
   for (const key of Object.keys(schema).sort()) {
-    if (ANNOTATION_KEYWORDS.has(key)) continue;
-    canonical[key] = canonicalNode(doc, schema[key], activeRefs, budget);
+    if (key === '$ref' || ANNOTATION_KEYWORDS.has(key)) continue;
+    const value = schema[key];
+
+    if (types.size > 0 && (key === 'type' || key === 'nullable')) {
+      // Every integer is a number, so naming both adds nothing.
+      if (key === 'type') out.type = [...types].filter(type => type !== 'integer' || !types.has('number')).sort();
+      continue;
+    }
+    if (ZERO_DEFAULT_KEYWORDS.has(key) && value === 0) continue;
+    if (FALSE_DEFAULT_KEYWORDS.has(key) && value === false) continue;
+
+    if (SUBSCHEMA_MAP_KEYWORDS.has(key) && isPlainObject(value)) {
+      const map: JsonObject = {};
+      for (const name of Object.keys(value).sort()) map[name] = canonicalSchema(state, value[name]);
+      out[key] = map;
+    } else if ((SUBSCHEMA_LIST_KEYWORDS.has(key) || key === 'items') && Array.isArray(value)) {
+      const branches = value.map(item => canonicalSchema(state, item));
+      out[key] = UNORDERED_LIST_KEYWORDS.has(key)
+        ? sortedByKey(branches, IDEMPOTENT_LIST_KEYWORDS.has(key))
+        : branches;
+    } else if (SUBSCHEMA_KEYWORDS.has(key)) {
+      out[key] = canonicalSchema(state, value);
+    } else if (key === 'dependencies' && isPlainObject(value)) {
+      // Draft-04 style: a name maps to either a schema or a list of names.
+      const map: JsonObject = {};
+      for (const name of Object.keys(value).sort()) {
+        const entry = value[name];
+        map[name] = Array.isArray(entry) ? canonicalData(state, entry) : canonicalSchema(state, entry);
+      }
+      out[key] = map;
+    } else if (key === 'required' && Array.isArray(value) && value.every(item => typeof item === 'string')) {
+      if (value.length > 0) out[key] = sortedByKey(value, true);
+    } else if (key === 'enum' && Array.isArray(value)) {
+      out[key] = sortedByKey(value.map(item => canonicalData(state, item)), true);
+    } else {
+      out[key] = canonicalData(state, value);
+    }
   }
-  return canonical;
+  return out;
+}
+
+function isPlainObject(value: unknown): value is JsonObject {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

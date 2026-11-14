@@ -17,7 +17,7 @@ import {
   rawNumericLowerBound,
   rawNumericUpperBound,
   record,
-  resolve,
+  resolveSchema,
   strings,
   valueKey,
 } from './schema';
@@ -86,9 +86,15 @@ function mergeAllOf(doc: Document, schema: JsonObject): FlattenedSchema {
   if (Object.keys(enclosing).length > 0) units.push(enclosing);
 
   for (const raw of branches) {
+    // `true` accepts everything and adds nothing to an intersection. Any other
+    // branch that is not a schema object (`false` included) is left unmerged.
+    if (raw === true) continue;
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      return inexact(schema, 'a branch is not a schema object');
+    }
     let resolved: JsonObject;
     try {
-      resolved = resolve(doc.root, raw);
+      resolved = resolveSchema(doc, raw);
     } catch {
       return inexact(schema, 'a branch reference could not be resolved');
     }
@@ -98,7 +104,11 @@ function mergeAllOf(doc: Document, schema: JsonObject): FlattenedSchema {
     }
     units.push(inner.schema);
   }
+  if (units.length === 0) return { schema: {}, exact: true, reason: null };
   if (units.length === 1) return { schema: units[0], exact: true, reason: null };
+
+  const contextual = contextualConflict(units);
+  if (contextual) return inexact(schema, contextual);
 
   const merged: JsonObject = {};
 
@@ -155,6 +165,57 @@ function mergeAllOf(doc: Document, schema: JsonObject): FlattenedSchema {
   writeCountBounds(units, merged);
 
   return { schema: merged, exact: true, reason: null };
+}
+
+/**
+ * Keywords that are read together with their neighbours in the same schema
+ * object. `then` does nothing without the `if` beside it, and `minContains`
+ * nothing without `contains`, so collecting them from different branches into
+ * one object would create a constraint that no branch declared.
+ */
+const KEYWORD_GROUPS: readonly (readonly string[])[] = [
+  ['if', 'then', 'else'],
+  ['contains', 'minContains', 'maxContains'],
+];
+
+/** Keywords that decide which array elements `items` applies to. */
+const POSITIONAL_ITEM_KEYWORDS = ['prefixItems', 'additionalItems'] as const;
+
+/**
+ * Finds keywords whose meaning depends on the schema object they are written
+ * in, and which a keyword-by-keyword merge would therefore change.
+ */
+function contextualConflict(units: JsonObject[]): string | null {
+  // `unevaluated*` sees only what its own schema object evaluates, so it stops
+  // meaning the same thing once the other branches are moved next to it.
+  for (const keyword of ['unevaluatedProperties', 'unevaluatedItems']) {
+    if (units.some(unit => keyword in unit)) {
+      return `\`${keyword}\` depends on the branch it is declared in`;
+    }
+  }
+
+  for (const group of KEYWORD_GROUPS) {
+    const declared = new Set<string>();
+    for (const unit of units) {
+      const own: JsonObject = {};
+      for (const keyword of group) if (keyword in unit) own[keyword] = unit[keyword];
+      if (Object.keys(own).length > 0) declared.add(valueKey(group.map(keyword => own[keyword] ?? null)));
+    }
+    if (declared.size > 1) {
+      return `\`${group.join('`/`')}\` are split across branches`;
+    }
+  }
+
+  // `items` skips the positions `prefixItems` covers, but only in its own
+  // schema object: in a separate branch it constrains every element.
+  const arrays = units.filter(unit =>
+    'items' in unit || POSITIONAL_ITEM_KEYWORDS.some(keyword => keyword in unit));
+  const positional = arrays.some(unit =>
+    Array.isArray(unit.items) || POSITIONAL_ITEM_KEYWORDS.some(keyword => keyword in unit));
+  if (positional && arrays.length > 1) {
+    return 'positional array keywords are split across branches';
+  }
+  return null;
 }
 
 /**
@@ -262,12 +323,12 @@ function writeCountBounds(units: JsonObject[], merged: JsonObject): void {
  */
 export type BranchDelta = 'unchanged' | 'added' | 'removed' | 'changed' | 'indeterminate';
 
-function canonicalMultiset(doc: Document, branches: unknown[]): Map<string, number> | null {
+function canonicalMultiset(doc: Document, branches: unknown[], distinct: boolean): Map<string, number> | null {
   const counts = new Map<string, number>();
   for (const branch of branches) {
     const key = canonicalize(doc, branch);
     if (key === null) return null;
-    counts.set(key, (counts.get(key) ?? 0) + 1);
+    counts.set(key, distinct ? 1 : (counts.get(key) ?? 0) + 1);
   }
   return counts;
 }
@@ -283,15 +344,20 @@ function covers(outer: Map<string, number>, inner: Map<string, number>): boolean
  * Compares two lists of alternatives as multisets of fully resolved schemas, so
  * reordering the alternatives, or renaming the `$ref` that reaches an unchanged
  * one, is recognised as no change at all.
+ *
+ * `idempotent` says that repeating an alternative changes nothing, which holds
+ * for `anyOf` and not for `oneOf`, where a repeated alternative can never be
+ * the only one that matches.
  */
 export function compareBranchLists(
   before: Document,
   beforeBranches: unknown[],
   after: Document,
   afterBranches: unknown[],
+  idempotent = false,
 ): BranchDelta {
-  const left = canonicalMultiset(before, beforeBranches);
-  const right = canonicalMultiset(after, afterBranches);
+  const left = canonicalMultiset(before, beforeBranches, idempotent);
+  const right = canonicalMultiset(after, afterBranches, idempotent);
   if (!left || !right) return 'indeterminate';
   const leftCoversRight = covers(left, right);
   const rightCoversLeft = covers(right, left);

@@ -93,7 +93,7 @@ Every finding carries a stable rule code:
 | `RESPONSE_ITEM_COUNT_WIDENED` | A response array's `minItems`/`maxItems` guarantee relaxed. |
 | `REQUEST_FIELD_REMOVED` | A property was dropped from a request schema with `additionalProperties: false`. |
 | `RESPONSE_FIELD_REMOVED` | A response property was removed, in a success or an error body. |
-| `RESPONSE_FIELD_OPTIONAL` | A previously guaranteed (`required`) response property is now optional. |
+| `RESPONSE_FIELD_OPTIONAL` | A previously guaranteed (`required`) response property is now optional. The guarantee is read from `required`, whether or not the name is also declared under `properties`. |
 | `RESPONSE_HEADER_REMOVED` | A documented response header is gone. Header names are matched without regard to case. |
 | `RESPONSE_HEADER_OPTIONAL` | A response header that was `required: true` is now optional. |
 | `RESPONSE_HEADER_SERIALIZATION_CHANGED` | `explode` changed on a header whose value is an object, so the value is written differently on the wire. |
@@ -184,15 +184,61 @@ would alter what the schema accepts:
 - Two branches declaring the same keyword differently (`pattern`, `multipleOf`, `oneOf`, …),
   since the intersection of two such constraints is not expressible as one schema.
 - `additionalProperties` combined with `patternProperties` or `unevaluatedProperties`.
+- **Keywords that are read together with their neighbours, split across branches.** `then`
+  and `else` do nothing without the `if` beside them, `minContains`/`maxContains` nothing
+  without `contains`, and `items` skips the positions covered by a `prefixItems` in the same
+  schema object only. Collecting these from different branches into one schema would create
+  a constraint no branch declared, so `allOf: [{if: …}, {then: …}]` is never read as
+  `{if: …, then: …}`. They merge normally when one branch declares the whole group.
+- `unevaluatedProperties` or `unevaluatedItems` anywhere in the composition, because they
+  see only what their own schema object evaluates.
+- A branch that is the boolean schema `false`, or not a schema at all. (`true` is dropped,
+  since it adds nothing to an intersection.)
 - A branch `$ref` that cannot be resolved, or a composition that references itself.
 
 Branch `description`, `title`, `example` and other annotations never block a merge.
 
+In an OpenAPI 3.1 document, keywords written beside a `$ref` constrain the instance together
+with the target, so `{$ref: …, maxLength: 10}` is compared as the `allOf` of the two and
+goes through the same merge. In OpenAPI 3.0 such siblings are ignored, as that version of the
+specification defines.
+
+### When two schemas count as the same
+
+Several decisions rest on whether a schema *changed*: an `anyOf`/`oneOf` list, an `allOf`
+that cannot be merged, and every keyword that is reported rather than evaluated. That is
+decided on a canonical form of the schema with internal `$ref`s expanded, and the rule is
+that two schemas are the same only when that is certain.
+
+Folded together, because they accept exactly the same instances:
+
+- object key order, and the order of `required`, `enum`, a `type` list and
+  `allOf`/`anyOf`/`oneOf` branches;
+- a repeated `allOf` or `anyOf` branch (not `oneOf`, where a repeated alternative can never
+  be the only one that matches);
+- a `$ref` and the schema it points at, so inlining or renaming a component is no change;
+- `nullable: true` and a `"null"` entry in `type`; `type: [integer, number]` and `number`;
+- `minLength`/`minItems`/`minProperties: 0`, `uniqueItems: false`, `nullable: false` and
+  `required: []`, which say what leaving the keyword out says;
+- annotations: `title`, `description`, `summary`, `default`, `example`, `examples`,
+  `deprecated`, `externalDocs`, `xml`, `$comment`, `$id`, `$schema`, `$anchor`.
+
+Annotations are dropped **only where they are keywords**. The same words are ordinary names
+as keys of `properties`, `patternProperties`, `dependentSchemas` and `$defs`, and ordinary
+data inside `enum`, `const` and any keyword that does not hold a subschema, where nothing is
+dropped and no `$ref` is followed. A property called `title`, `description` or `default`
+is compared like any other property, at any depth.
+
+Nothing else is folded. Two spellings that happen to be equivalent for a reason the engine
+does not model (`minimum: 1` on an integer against `exclusiveMinimum: 0` inside a union, a
+recursive component that was renamed) count as changed and are reported for review.
+
 ### `anyOf` and `oneOf` are compared by proof, never branch against branch
 
-Alternatives are compared as whole lists — as multisets of fully resolved schemas, so
-reordering them, or renaming a `$ref` that reaches an unchanged alternative, is recognised as
-no change. Pairing alternatives up and aggregating per-branch results would invent a
+Alternatives are compared as whole lists of fully resolved schemas (see
+[When two schemas count as the same](#when-two-schemas-count-as-the-same)), so reordering
+them, or renaming a `$ref` that reaches an unchanged alternative, is recognised as no change.
+`anyOf` is compared as a set, `oneOf` as a multiset. Pairing alternatives up and aggregating per-branch results would invent a
 correspondence the schema does not have, so it is not done.
 
 Only these cases are provable, and only they stay silent:
@@ -335,14 +381,14 @@ check and **do not** change the CLI exit code; they tell you where a human still
 | Notice code | Meaning |
 | --- | --- |
 | `UNSUPPORTED_COMPOSITION` | A composed schema could not be analysed: an `allOf` that cannot be merged without changing its meaning, or an `anyOf`/`oneOf` change whose effect depends on whether alternatives overlap. The message names the reason. |
-| `UNSUPPORTED_TUPLE_ITEMS` | `prefixItems` (3.1 tuple validation) is present and is not evaluated. |
-| `SCHEMA_NOT_COMPARED` | One side of a pair declares a schema and the other does not (media type, array `items`, parameter, response header), or a parameter uses `content` serialisation. |
+| `UNSUPPORTED_TUPLE_ITEMS` | `prefixItems` (3.1 tuple validation) or the array form of `items` is present and is not evaluated. |
+| `SCHEMA_NOT_COMPARED` | One side of a pair declares a schema and the other does not (media type, array `items`, parameter, response header), a parameter uses `content` serialisation, or a boolean schema (`true`/`false`) changed. |
 | `HEADER_NOT_COMPARED` | A response header changed in a way that is not evaluated: `style`, `explode` on a value whose type is not established, a switch between `schema` and `content`, a field outside the Header Object, or a name declared twice under different capitalisation. |
 | `RESPONSE_STATUS_ADDED` | A status code, range or `default` response is documented where nothing described it before. Whether the operation already returned it, and whether clients handle it, cannot be established. |
 | `RESPONSE_STATUS_REMOVED` | A non-success status code, range or `default` response is gone and nothing else describes it. It may no longer be returned, or be returned undocumented. |
 | `RESPONSE_COVERAGE_CHANGED` | A status is still documented, but by a different entry (an explicit code, its range, or `default`), and the new definition could not be shown to keep what the old one promised. The message lists the rule codes that differ. |
 | `SECURITY_NOT_COMPARED` | A `security` change could not be decided: it depends on a scheme that is undefined, unsupported, renamed or redefined, on a role list for a scheme without scopes, or on a malformed `security` value. Also raised once per scheme, at `components.securitySchemes.<name>`, when a definition changed underneath operations that still require it. See [Security requirements](#security-requirements). |
-| `CONSTRAINT_NOT_COMPARED` | A validation keyword that cannot be evaluated reliably changed: `pattern`, `format`, `multipleOf`, `uniqueItems`, `contains`/`minContains`/`maxContains`, `minProperties`/`maxProperties`, `patternProperties`, `propertyNames`, `dependentRequired`/`dependentSchemas`, `const`, `readOnly`/`writeOnly`, `unevaluatedProperties`/`unevaluatedItems`, or an `additionalProperties` subschema. Unchanged keywords stay quiet, since they cannot affect compatibility. |
+| `CONSTRAINT_NOT_COMPARED` | A validation keyword that cannot be evaluated reliably changed: `pattern`, `format`, `multipleOf`, `uniqueItems`, `contains`/`minContains`/`maxContains`, `minProperties`/`maxProperties`, `patternProperties`, `propertyNames`, `dependentRequired`/`dependentSchemas`, `const`, `readOnly`/`writeOnly`, `unevaluatedProperties`/`unevaluatedItems`, `not`, `if`/`then`/`else`, `discriminator`, `additionalItems`, `dependencies`, or an `additionalProperties` subschema (changed, introduced on a request, dropped on a response, or newly applying to a request field that is no longer declared). A keyword counts as changed when its meaning did, including when it is spelled the same but a schema it references changed. Unchanged keywords stay quiet, since they cannot affect compatibility. |
 
 ## What the engine does **not** support
 
@@ -382,8 +428,27 @@ check and **do not** change the CLI exit code; they tell you where a human still
   `uniqueItems`, `contains`, `minProperties`/`maxProperties`, `patternProperties`,
   `propertyNames`, `dependentRequired`, `const` and `readOnly`/`writeOnly`. A change to any
   of them raises `CONSTRAINT_NOT_COMPARED` instead of being treated as compatible.
-- **Annotation keywords** (`default`, `title`, `description`, `example`, `deprecated`) are
-  ignored entirely, including for notices.
+- **Annotation keywords** (`default`, `title`, `description`, `example`, `examples`,
+  `deprecated`, `externalDocs`, `xml`) are ignored entirely, including for notices. That
+  includes a changed request `default`, which can alter what the server does with an omitted
+  field. Properties that merely share a name with an annotation are compared normally.
+- **Newly declared properties** are treated as additive in both directions. A request
+  property declared where undeclared properties were accepted before can still reject values
+  that used to pass, and a response property added to an object that was closed or had an
+  `additionalProperties` subschema is new to clients; neither is reported.
+- **`additionalProperties` subschemas are not compared against each other.** Any change
+  that is not provably safe raises `CONSTRAINT_NOT_COMPARED`; no verdict is reached about
+  undeclared properties beyond `REQUEST_OBJECT_CLOSED` and `REQUEST_FIELD_REMOVED`.
+- **`enum` values are not filtered by `type`.** A value the declared type could never accept
+  still counts as an `enum` member, so adding or removing one can be reported although the
+  accepted instances did not change.
+- **Keywords beside a `$ref` in OpenAPI 3.0 documents** are ignored when schemas are
+  compared, as the specification defines, even though some tools honour them.
+- **Schema equivalence is syntactic beyond the listed foldings.** Inside `anyOf`/`oneOf`
+  branches and unmergeable `allOf`, equivalent schemas written differently are reported as
+  changed, and a renamed recursive component is reported as changed.
+- **Schemas too large to canonicalise** (more than 20,000 nodes once references are
+  expanded) are reported as changed rather than compared.
 - **`servers`, `webhooks`, `callbacks`, parameter `style`/`explode`** and OpenAPI document
   validation in general — ContractGuard only checks that `openapi` is `3.0.x`/`3.1.x` and
   that `paths` is an object.
@@ -396,8 +461,9 @@ check and **do not** change the CLI exit code; they tell you where a human still
   those cases.
 - **Specifications generated during the build** — `spec-path` is read from the checkout as it
   stands when the step runs; nothing is generated or fetched.
-- **Boolean schemas** (`items: true`, `additionalProperties: true`) are read as
-  unconstrained rather than evaluated as JSON Schema booleans.
+- **Boolean schemas** are not evaluated. `true` is read as the empty schema and a boolean
+  schema that changed raises `SCHEMA_NOT_COMPARED`; a component that is itself a boolean and
+  is reached through a `$ref` is read as unconstrained.
 
 ---
 
