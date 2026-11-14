@@ -71,8 +71,68 @@ Relaxations (security removed, an alternative added, a scope or combined scheme 
 equivalent spellings (reordering, repetition, `[]` versus `[{}]`, a requirement moved between
 the document and its operations) are recognised as compatible and reported as nothing.
 
+### Fixed
+
+**Schema changes that went unreported.** Whether a schema changed is decided on a canonical
+form, and that form was wrong in ways that hid real changes:
+
+- **Properties named like annotations.** Annotation keywords were dropped at every depth,
+  including where the same word is a property name. A property called `title`,
+  `description`, `default`, `example`, `examples`, `summary`, `deprecated`, `xml` or
+  `externalDocs` inside an `anyOf`/`oneOf` alternative, or inside an `allOf` that cannot be
+  merged, could change type, be added or be removed without any finding. Annotations are now
+  dropped only where they are keywords; keys of `properties`, `patternProperties`,
+  `dependentSchemas` and `$defs` are always kept, and the contents of `enum`, `const` and
+  other data are compared whole.
+- **Reported-only keywords behind a `$ref`.** `patternProperties`, `propertyNames`,
+  `dependentSchemas`, `contains`, `not`, `if`/`then`/`else`, `unevaluated*` and an
+  `additionalProperties` subschema were compared as written, so a keyword pointing at a
+  component raised nothing when the component changed. They are now compared by meaning,
+  with references expanded.
+- **`allOf` merged across keywords that depend on their neighbours.** `if` in one branch and
+  `then`/`else` in another, `contains` apart from `minContains`/`maxContains`, `items` apart
+  from `prefixItems`, and `unevaluatedProperties`/`unevaluatedItems` anywhere were collected
+  into one schema that meant something else. Such compositions are no longer merged and
+  raise `UNSUPPORTED_COMPOSITION` when they change. A `false` branch is no longer read as an
+  empty schema.
+- **Keywords beside a `$ref` in OpenAPI 3.1.** They were discarded; a tightened `maxLength`
+  or a new `required` next to a `$ref` was invisible. They are now compared as the `allOf`
+  of the target and the siblings. OpenAPI 3.0 documents are unaffected, since that version
+  ignores such siblings.
+- **`additionalProperties` transitions.** Introducing a subschema on a request object that
+  accepted anything, dropping one on a response, and a request field that stops being
+  declared and falls under the subschema now raise `CONSTRAINT_NOT_COMPARED`.
+- **`required` without a matching property.** A response that stopped guaranteeing a name
+  listed in `required` but not in `properties` now raises `RESPONSE_FIELD_OPTIONAL`.
+- **`discriminator` changes** were documented as raising `CONSTRAINT_NOT_COMPARED` but were
+  ignored. They are now reported.
+- **Boolean schemas** (`true`/`false`) that changed were read as two empty schemas; they now
+  raise `SCHEMA_NOT_COMPARED`. The array form of `items` raises `UNSUPPORTED_TUPLE_ITEMS`
+  instead of being read as an empty schema.
+- **Recursive schemas** whose recursion returns to different places could share a canonical
+  form. The point a recursion is anchored at is now part of it.
+
+**Equivalent schemas reported as changed.** The canonical form now also folds spellings
+that accept exactly the same instances: the order of `required`, `enum`, `type` lists and
+`allOf`/`anyOf`/`oneOf` branches at any depth, repeated `allOf`/`anyOf` branches,
+`nullable: true` against a `"null"` type, and keywords set to the value they have when
+absent (`minLength: 0`, `uniqueItems: false`, `required: []`, …). `anyOf` lists are compared
+as sets, so repeating an alternative is no change. A reported-only keyword whose value was
+only reordered or re-annotated no longer raises a notice, and `additionalProperties: true`
+or `{}` is the same as leaving it out.
+
 ### Changed
 
+- **Upgrade note:** the fixes above surface changes that used to pass unnoticed. Most
+  arrive as review notices (`UNSUPPORTED_COMPOSITION`, `CONSTRAINT_NOT_COMPARED`,
+  `SCHEMA_NOT_COMPARED`), which do not fail the check. Three can now fail it: constraints
+  beside a `$ref` in OpenAPI 3.1 documents, which go through the ordinary rules;
+  `RESPONSE_FIELD_OPTIONAL` for a `required` name without a declared property; and any rule
+  inside an `allOf` whose branches hold boolean `true`. No rule code was added, removed or
+  renamed.
+- `CONSTRAINT_NOT_COMPARED` now also covers `discriminator`, `additionalItems` and
+  `dependencies`, and says "changed through a schema it references" when the keyword itself
+  is spelled the same on both sides.
 - `SUCCESS_RESPONSE_REMOVED` is no longer raised when a removed `2xx` code is described by a
   `2XX` range that keeps everything it promised. It is now also raised for a removed `2XX`
   range that leaves no success response behind. A `default` response never stands in for a
@@ -102,6 +162,13 @@ Media types are matched literally (no ranges, parameters or case folding), respo
 are not compared, header `style` values other than `simple` are reported rather than
 evaluated, and differences found while matching a status to a range or `default` are
 summarised in one notice. See the README.
+
+Schema equivalence is deliberately narrow: beyond the foldings listed above, two spellings
+of the same constraint inside a union or an unmergeable `allOf` count as changed and are
+reported for review, as is a renamed recursive component. `additionalProperties` subschemas
+are reported, not compared; newly declared properties are treated as additive in both
+directions; `enum` values are not filtered by `type`; and keywords beside a `$ref` are
+ignored in OpenAPI 3.0 documents.
 
 ## [0.1.0] - 2026-11-04
 

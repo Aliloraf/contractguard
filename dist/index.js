@@ -32359,8 +32359,10 @@ const MAX_SCHEMA_DEPTH = 64;
  * Validation keywords that affect compatibility but cannot be compared
  * reliably: `pattern` would need regular expression inclusion analysis,
  * `format` needs a registry of value spaces, and the rest need instance-level
- * reasoning. A change to any of them is surfaced as a notice rather than
- * passed over as compatible.
+ * reasoning. `discriminator` does not validate anything, but it tells clients
+ * which alternative a payload is, so changing it changes how the same payload
+ * is read. A change to any of them is surfaced as a notice rather than passed
+ * over as compatible.
  */
 const UNCOMPARED_CONSTRAINTS = [
     'multipleOf',
@@ -32385,6 +32387,9 @@ const UNCOMPARED_CONSTRAINTS = [
     'if',
     'then',
     'else',
+    'additionalItems',
+    'dependencies',
+    'discriminator',
 ];
 const RANGE_RULES = {
     range: { narrowed: 'REQUEST_RANGE_NARROWED', widened: 'RESPONSE_RANGE_WIDENED' },
@@ -32528,7 +32533,7 @@ function compareUnions(before, after, oldSchema, newSchema, location, direction,
             report.notice('UNSUPPORTED_COMPOSITION', location, `\`${keyword}\` was ${oldDeclared ? 'removed' : 'added'}; whether the same instances are still accepted cannot be established. Review this subschema manually.`);
             continue;
         }
-        const delta = (0, composition_1.compareBranchLists)(before, oldBranches, after, newBranches);
+        const delta = (0, composition_1.compareBranchLists)(before, oldBranches, after, newBranches, keyword === 'anyOf');
         if (delta === 'unchanged')
             continue;
         if (keyword === 'anyOf' && direction === 'request' && delta === 'added')
@@ -32540,7 +32545,8 @@ function compareUnions(before, after, oldSchema, newSchema, location, direction,
 }
 /** Flags keywords that are present but not evaluated, so reports stay honest. */
 function noteUnevaluatedKeywords(oldSchema, newSchema, location, report) {
-    if ('prefixItems' in oldSchema || 'prefixItems' in newSchema) {
+    if ('prefixItems' in oldSchema || 'prefixItems' in newSchema
+        || Array.isArray(oldSchema.items) || Array.isArray(newSchema.items)) {
         report.notice('UNSUPPORTED_TUPLE_ITEMS', location, 'Tuple validation (`prefixItems`) is not evaluated; review positional array changes manually.');
     }
 }
@@ -32551,27 +32557,76 @@ function describeConstraint(value) {
     return text.length > 60 ? `${text.slice(0, 57)}...` : text;
 }
 /**
+ * The meaning of one keyword, with the references inside it expanded. Comparing
+ * the keyword as written would miss a change to a schema it only points at.
+ * `null` means the keyword is too large to canonicalise.
+ */
+function constraintMeaning(doc, keyword, value) {
+    return (0, schema_1.canonicalize)(doc, value === undefined ? {} : { [keyword]: value });
+}
+function sameConstraint(before, after, keyword, oldValue, newValue) {
+    const left = constraintMeaning(before, keyword, oldValue);
+    const right = constraintMeaning(after, keyword, newValue);
+    return left !== null && right !== null && left === right;
+}
+function extrasKind(doc, value) {
+    if (value === undefined || value === true)
+        return 'open';
+    if (value === false)
+        return 'closed';
+    return (0, schema_1.canonicalize)(doc, value) === '{}' ? 'open' : 'schema';
+}
+/**
+ * Undeclared properties follow the same direction rule as everything else, but
+ * a subschema cannot be compared against "anything goes", so the transitions
+ * that are not provably safe are reported for review. Closing a request object
+ * is reported as breaking by the caller; a response that starts allowing
+ * undeclared properties adds fields, which clients are expected to tolerate.
+ */
+function noteAdditionalProperties(before, after, oldSchema, newSchema, location, direction, report) {
+    if (!(0, schema_1.constraintApplies)(oldSchema, newSchema, ['object']))
+        return;
+    const oldExtras = oldSchema.additionalProperties;
+    const newExtras = newSchema.additionalProperties;
+    const was = extrasKind(before, oldExtras);
+    const now = extrasKind(after, newExtras);
+    if (was === 'schema' && now === 'schema') {
+        if (!sameConstraint(before, after, 'additionalProperties', oldExtras, newExtras)) {
+            report.notice('CONSTRAINT_NOT_COMPARED', location, 'The `additionalProperties` subschema changed; undeclared property compatibility was not evaluated.');
+        }
+        return;
+    }
+    if (direction === 'request' && was === 'open' && now === 'schema') {
+        report.notice('CONSTRAINT_NOT_COMPARED', location, 'An `additionalProperties` subschema was introduced; undeclared properties that were accepted as anything must now match it, and which requests are rejected was not evaluated.');
+    }
+    if (direction === 'response' && was === 'schema' && now === 'open') {
+        report.notice('CONSTRAINT_NOT_COMPARED', location, 'The `additionalProperties` subschema was removed; undeclared properties may now hold any value, and whether clients reading them still cope was not evaluated.');
+    }
+}
+/**
  * Reports validation keywords that changed but cannot be evaluated, so a clean
  * breaking list is never mistaken for proof that the constraint still holds.
- * An unchanged keyword cannot affect compatibility, so it stays quiet.
+ * An unchanged keyword cannot affect compatibility, so it stays quiet. Change
+ * is judged on meaning: a keyword spelled the same on both sides has still
+ * changed when a schema it references has.
  */
-function noteChangedConstraints(oldSchema, newSchema, location, report) {
+function noteChangedConstraints(before, after, oldSchema, newSchema, location, direction, report) {
     for (const keyword of UNCOMPARED_CONSTRAINTS) {
-        const before = oldSchema[keyword];
-        const after = newSchema[keyword];
-        if (before === undefined && after === undefined)
+        const oldValue = oldSchema[keyword];
+        const newValue = newSchema[keyword];
+        if (oldValue === undefined && newValue === undefined)
             continue;
-        if ((0, schema_1.valueKey)(before) === (0, schema_1.valueKey)(after))
+        if (sameConstraint(before, after, keyword, oldValue, newValue))
             continue;
-        report.notice('CONSTRAINT_NOT_COMPARED', location, `\`${keyword}\` changed (${describeConstraint(before)} → ${describeConstraint(after)}); this constraint is not evaluated and must be reviewed manually.`);
+        const change = (0, schema_1.valueKey)(oldValue) === (0, schema_1.valueKey)(newValue)
+            ? 'changed through a schema it references'
+            : `changed (${describeConstraint(oldValue)} → ${describeConstraint(newValue)})`;
+        report.notice('CONSTRAINT_NOT_COMPARED', location, `\`${keyword}\` ${change}; this constraint is not evaluated and must be reviewed manually.`);
     }
-    const beforeExtras = oldSchema.additionalProperties;
-    const afterExtras = newSchema.additionalProperties;
-    if (typeof beforeExtras === 'object' && beforeExtras !== null
-        && typeof afterExtras === 'object' && afterExtras !== null
-        && (0, schema_1.valueKey)(beforeExtras) !== (0, schema_1.valueKey)(afterExtras)) {
-        report.notice('CONSTRAINT_NOT_COMPARED', location, 'The `additionalProperties` subschema changed; undeclared property compatibility was not evaluated.');
-    }
+    noteAdditionalProperties(before, after, oldSchema, newSchema, location, direction, report);
+}
+function describeBoolean(raw) {
+    return typeof raw === 'boolean' ? `\`${raw}\`` : 'a schema';
 }
 /** True when both schemas mean the same thing once references are expanded. */
 function sameMeaning(before, oldSchema, after, newSchema) {
@@ -32580,8 +32635,16 @@ function sameMeaning(before, oldSchema, after, newSchema) {
     return left !== null && right !== null && left === right;
 }
 function compareSchema(before, after, oldRaw, newRaw, location, direction, report, seen, depth) {
-    const oldResolved = (0, schema_1.resolve)(before.root, oldRaw);
-    const newResolved = (0, schema_1.resolve)(after.root, newRaw);
+    // The boolean schemas accept everything or nothing. They carry no keywords
+    // to compare, so anything but an unchanged meaning is left for review.
+    if (typeof oldRaw === 'boolean' || typeof newRaw === 'boolean') {
+        if (!sameMeaning(before, oldRaw, after, newRaw)) {
+            report.notice('SCHEMA_NOT_COMPARED', location, `A boolean schema is involved (${describeBoolean(oldRaw)} → ${describeBoolean(newRaw)}); this subschema was not compared.`);
+        }
+        return;
+    }
+    const oldResolved = (0, schema_1.resolveSchema)(before, oldRaw);
+    const newResolved = (0, schema_1.resolveSchema)(after, newRaw);
     const visited = seen.get(oldResolved);
     if (visited?.has(newResolved))
         return;
@@ -32608,7 +32671,7 @@ function compareSchema(before, after, oldRaw, newRaw, location, direction, repor
     const oldSchema = oldFlat.schema;
     const newSchema = newFlat.schema;
     noteUnevaluatedKeywords(oldSchema, newSchema, location, report);
-    noteChangedConstraints(oldSchema, newSchema, location, report);
+    noteChangedConstraints(before, after, oldSchema, newSchema, location, direction, report);
     compareUnions(before, after, oldSchema, newSchema, location, direction, report);
     compareTypes(oldSchema, newSchema, location, direction, report);
     compareEnums(oldSchema, newSchema, location, direction, report);
@@ -32627,9 +32690,16 @@ function compareSchema(before, after, oldRaw, newRaw, location, direction, repor
             && (0, schema_1.constraintApplies)(oldSchema, newSchema, ['object'])) {
             report.breaking('REQUEST_OBJECT_CLOSED', location, 'Object now rejects undeclared properties (additionalProperties: false); requests carrying extra fields are refused.');
         }
+        const newExtras = extrasKind(after, newSchema.additionalProperties);
         for (const name of Object.keys(oldProperties)) {
-            if (!(name in newProperties) && (0, schema_1.isClosedObject)(newSchema)) {
+            if (name in newProperties)
+                continue;
+            if (newExtras === 'closed') {
                 report.breaking('REQUEST_FIELD_REMOVED', `${location}.${name}`, 'Previously accepted field removed from a closed object schema.');
+            }
+            else if (newExtras === 'schema') {
+                // The field is still accepted, but as an undeclared property.
+                report.notice('CONSTRAINT_NOT_COMPARED', `${location}.${name}`, 'Field is no longer declared, so it now has to match the `additionalProperties` subschema; whether its former values still do was not evaluated.');
             }
         }
     }
@@ -32638,9 +32708,15 @@ function compareSchema(before, after, oldRaw, newRaw, location, direction, repor
             if (!(name in newProperties)) {
                 report.breaking('RESPONSE_FIELD_REMOVED', `${location}.${name}`, 'Response field removed.');
             }
-            else if (oldRequired.has(name) && !newRequired.has(name)) {
-                report.breaking('RESPONSE_FIELD_OPTIONAL', `${location}.${name}`, 'Previously guaranteed response field is now optional.');
-            }
+        }
+        // `required` guarantees presence whether or not the name is also declared
+        // under `properties`, so the guarantee is read from `required` alone.
+        for (const name of oldRequired) {
+            if (newRequired.has(name))
+                continue;
+            if (name in oldProperties && !(name in newProperties))
+                continue;
+            report.breaking('RESPONSE_FIELD_OPTIONAL', `${location}.${name}`, 'Previously guaranteed response field is now optional.');
         }
     }
     for (const name of Object.keys(oldProperties)) {
@@ -32650,7 +32726,10 @@ function compareSchema(before, after, oldRaw, newRaw, location, direction, repor
     }
     const oldItems = oldSchema.items;
     const newItems = newSchema.items;
-    if (oldItems !== undefined && newItems !== undefined) {
+    if (Array.isArray(oldItems) || Array.isArray(newItems)) {
+        // Positional items: already reported as unevaluated tuple validation.
+    }
+    else if (oldItems !== undefined && newItems !== undefined) {
         compareSchema(before, after, oldItems, newItems, `${location}[]`, direction, report, seen, depth + 1);
     }
     else if (oldItems !== undefined || newItems !== undefined) {
@@ -32848,9 +32927,16 @@ function mergeAllOf(doc, schema) {
     if (Object.keys(enclosing).length > 0)
         units.push(enclosing);
     for (const raw of branches) {
+        // `true` accepts everything and adds nothing to an intersection. Any other
+        // branch that is not a schema object (`false` included) is left unmerged.
+        if (raw === true)
+            continue;
+        if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+            return inexact(schema, 'a branch is not a schema object');
+        }
         let resolved;
         try {
-            resolved = (0, schema_1.resolve)(doc.root, raw);
+            resolved = (0, schema_1.resolveSchema)(doc, raw);
         }
         catch {
             return inexact(schema, 'a branch reference could not be resolved');
@@ -32861,8 +32947,13 @@ function mergeAllOf(doc, schema) {
         }
         units.push(inner.schema);
     }
+    if (units.length === 0)
+        return { schema: {}, exact: true, reason: null };
     if (units.length === 1)
         return { schema: units[0], exact: true, reason: null };
+    const contextual = contextualConflict(units);
+    if (contextual)
+        return inexact(schema, contextual);
     const merged = {};
     // Keywords this module does not understand: safe only while branches agree.
     for (const unit of units) {
@@ -32922,6 +33013,53 @@ function mergeAllOf(doc, schema) {
     writeNumericBounds(units, merged);
     writeCountBounds(units, merged);
     return { schema: merged, exact: true, reason: null };
+}
+/**
+ * Keywords that are read together with their neighbours in the same schema
+ * object. `then` does nothing without the `if` beside it, and `minContains`
+ * nothing without `contains`, so collecting them from different branches into
+ * one object would create a constraint that no branch declared.
+ */
+const KEYWORD_GROUPS = [
+    ['if', 'then', 'else'],
+    ['contains', 'minContains', 'maxContains'],
+];
+/** Keywords that decide which array elements `items` applies to. */
+const POSITIONAL_ITEM_KEYWORDS = ['prefixItems', 'additionalItems'];
+/**
+ * Finds keywords whose meaning depends on the schema object they are written
+ * in, and which a keyword-by-keyword merge would therefore change.
+ */
+function contextualConflict(units) {
+    // `unevaluated*` sees only what its own schema object evaluates, so it stops
+    // meaning the same thing once the other branches are moved next to it.
+    for (const keyword of ['unevaluatedProperties', 'unevaluatedItems']) {
+        if (units.some(unit => keyword in unit)) {
+            return `\`${keyword}\` depends on the branch it is declared in`;
+        }
+    }
+    for (const group of KEYWORD_GROUPS) {
+        const declared = new Set();
+        for (const unit of units) {
+            const own = {};
+            for (const keyword of group)
+                if (keyword in unit)
+                    own[keyword] = unit[keyword];
+            if (Object.keys(own).length > 0)
+                declared.add((0, schema_1.valueKey)(group.map(keyword => own[keyword] ?? null)));
+        }
+        if (declared.size > 1) {
+            return `\`${group.join('`/`')}\` are split across branches`;
+        }
+    }
+    // `items` skips the positions `prefixItems` covers, but only in its own
+    // schema object: in a separate branch it constrains every element.
+    const arrays = units.filter(unit => 'items' in unit || POSITIONAL_ITEM_KEYWORDS.some(keyword => keyword in unit));
+    const positional = arrays.some(unit => Array.isArray(unit.items) || POSITIONAL_ITEM_KEYWORDS.some(keyword => keyword in unit));
+    if (positional && arrays.length > 1) {
+        return 'positional array keywords are split across branches';
+    }
+    return null;
 }
 /**
  * `additionalProperties` is the keyword that makes naive flattening unsound. It
@@ -33033,13 +33171,13 @@ function writeCountBounds(units, merged) {
             merged[keyword] = bound.limit;
     }
 }
-function canonicalMultiset(doc, branches) {
+function canonicalMultiset(doc, branches, distinct) {
     const counts = new Map();
     for (const branch of branches) {
         const key = (0, schema_1.canonicalize)(doc, branch);
         if (key === null)
             return null;
-        counts.set(key, (counts.get(key) ?? 0) + 1);
+        counts.set(key, distinct ? 1 : (counts.get(key) ?? 0) + 1);
     }
     return counts;
 }
@@ -33054,10 +33192,14 @@ function covers(outer, inner) {
  * Compares two lists of alternatives as multisets of fully resolved schemas, so
  * reordering the alternatives, or renaming the `$ref` that reaches an unchanged
  * one, is recognised as no change at all.
+ *
+ * `idempotent` says that repeating an alternative changes nothing, which holds
+ * for `anyOf` and not for `oneOf`, where a repeated alternative can never be
+ * the only one that matches.
  */
-function compareBranchLists(before, beforeBranches, after, afterBranches) {
-    const left = canonicalMultiset(before, beforeBranches);
-    const right = canonicalMultiset(after, afterBranches);
+function compareBranchLists(before, beforeBranches, after, afterBranches, idempotent = false) {
+    const left = canonicalMultiset(before, beforeBranches, idempotent);
+    const right = canonicalMultiset(after, afterBranches, idempotent);
     if (!left || !right)
         return 'indeterminate';
     const leftCoversRight = covers(left, right);
@@ -33585,9 +33727,9 @@ function headerSet(root, value) {
 }
 const UNDECIDED_KEYWORDS = ['anyOf', 'oneOf', 'not', 'if', 'then', 'else', 'enum', 'const'];
 function objectValues(doc, rawSchema) {
-    if (rawSchema === undefined)
+    if (rawSchema === undefined || typeof rawSchema === 'boolean')
         return 'unknown';
-    const flat = (0, composition_1.flattenAllOf)(doc, (0, schema_1.resolve)(doc.root, rawSchema));
+    const flat = (0, composition_1.flattenAllOf)(doc, (0, schema_1.resolveSchema)(doc, rawSchema));
     if (!flat.exact)
         return 'unknown';
     const types = (0, schema_1.effectiveTypes)(flat.schema);
@@ -33818,12 +33960,13 @@ function compareResponses(before, after, oldOperation, newOperation, where, repo
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.UPPER_UNBOUNDED = exports.LOWER_UNBOUNDED = exports.NUMERIC_TYPES = exports.ANNOTATION_KEYWORDS = void 0;
+exports.UPPER_UNBOUNDED = exports.LOWER_UNBOUNDED = exports.NUMERIC_TYPES = exports.SUBSCHEMA_MAP_KEYWORDS = exports.SUBSCHEMA_LIST_KEYWORDS = exports.SUBSCHEMA_KEYWORDS = exports.ANNOTATION_KEYWORDS = void 0;
 exports.documentFor = documentFor;
 exports.record = record;
 exports.strings = strings;
 exports.valueKey = valueKey;
 exports.resolve = resolve;
+exports.resolveSchema = resolveSchema;
 exports.effectiveTypes = effectiveTypes;
 exports.permits = permits;
 exports.intersectTypes = intersectTypes;
@@ -33846,14 +33989,44 @@ exports.canonicalize = canonicalize;
  * Keywords that carry no validation meaning. They are dropped when schemas are
  * merged or canonicalised, so two schemas that differ only in their prose are
  * treated as the same contract.
+ *
+ * This is a set of *keywords*, and only applies where a keyword can appear:
+ * directly inside a schema object. The same strings are ordinary names when
+ * they are keys of `properties` or of any other map, and ordinary data inside
+ * `enum`, `const` and the like, where they must never be dropped.
  */
 exports.ANNOTATION_KEYWORDS = new Set([
     'title', 'description', 'summary', 'example', 'examples', 'default', 'deprecated',
-    '$comment', '$id', '$schema', '$anchor', 'externalDocs', 'xml', 'discriminator',
+    '$comment', '$id', '$schema', '$anchor', 'externalDocs', 'xml',
+]);
+/** Keywords whose value is a single subschema. */
+exports.SUBSCHEMA_KEYWORDS = new Set([
+    'items', 'additionalProperties', 'additionalItems', 'not', 'if', 'then', 'else',
+    'contains', 'propertyNames', 'unevaluatedProperties', 'unevaluatedItems', 'contentSchema',
+]);
+/** Keywords whose value is a list of subschemas. */
+exports.SUBSCHEMA_LIST_KEYWORDS = new Set([
+    'allOf', 'anyOf', 'oneOf', 'prefixItems',
+]);
+/**
+ * Keywords whose value is a map from an arbitrary name to a subschema. The keys
+ * of these maps are property names, patterns or definition names chosen by the
+ * API author, never schema keywords.
+ */
+exports.SUBSCHEMA_MAP_KEYWORDS = new Set([
+    'properties', 'patternProperties', 'dependentSchemas', '$defs', 'definitions',
 ]);
 exports.NUMERIC_TYPES = ['number', 'integer'];
 function documentFor(root) {
-    return { root, flattened: new WeakMap(), canonical: new WeakMap() };
+    const version = root.openapi;
+    const ignoresSiblings = 'swagger' in root || (typeof version === 'string' && /^3\.0(\.|$)/.test(version));
+    return {
+        root,
+        flattened: new WeakMap(),
+        canonical: new WeakMap(),
+        refSiblingsApply: !ignoresSiblings,
+        refCompositions: new WeakMap(),
+    };
 }
 function record(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -33869,6 +34042,19 @@ function valueKey(value) {
 function pointerSegments(ref) {
     return ref.slice(2).split('/').map(segment => segment.replace(/~1/g, '/').replace(/~0/g, '~'));
 }
+/** Follows one internal reference. */
+function dereference(root, ref) {
+    if (!ref.startsWith('#/')) {
+        throw new Error(`Only internal OpenAPI references are supported: ${ref}`);
+    }
+    let target = root;
+    for (const key of pointerSegments(ref)) {
+        target = record(target)[key];
+        if (target === undefined)
+            throw new Error(`Unresolved OpenAPI reference: ${ref}`);
+    }
+    return record(target);
+}
 function resolve(root, value) {
     let current = record(value);
     const seen = new Set();
@@ -33881,13 +34067,46 @@ function resolve(root, value) {
             throw new Error(`Cyclic $ref alias: ${ref}`);
         }
         seen.add(ref);
-        let target = root;
-        for (const key of pointerSegments(ref)) {
-            target = record(target)[key];
-            if (target === undefined)
-                throw new Error(`Unresolved OpenAPI reference: ${ref}`);
+        current = dereference(root, ref);
+    }
+    return current;
+}
+function hasConstrainingSiblings(schema) {
+    for (const key of Object.keys(schema)) {
+        if (key !== '$ref' && !exports.ANNOTATION_KEYWORDS.has(key))
+            return true;
+    }
+    return false;
+}
+/**
+ * Resolves a schema the way `resolve` does, but without losing keywords written
+ * beside a `$ref` where the document's dialect makes them count. Such a schema
+ * is the intersection of its target and its own keywords, so it is returned as
+ * the equivalent `allOf`, which the comparator then merges like any other. The
+ * result is memoised so the same schema always yields the same object.
+ */
+function resolveSchema(doc, value) {
+    let current = record(value);
+    const seen = new Set();
+    while (typeof current.$ref === 'string') {
+        const ref = current.$ref;
+        if (doc.refSiblingsApply && hasConstrainingSiblings(current)) {
+            let composition = doc.refCompositions.get(current);
+            if (!composition) {
+                const siblings = {};
+                for (const key of Object.keys(current)) {
+                    if (key !== '$ref' && !exports.ANNOTATION_KEYWORDS.has(key))
+                        siblings[key] = current[key];
+                }
+                composition = { allOf: [{ $ref: ref }, siblings] };
+                doc.refCompositions.set(current, composition);
+            }
+            return composition;
         }
-        current = record(target);
+        if (seen.has(ref))
+            throw new Error(`Cyclic $ref alias: ${ref}`);
+        seen.add(ref);
+        current = dereference(doc.root, ref);
     }
     return current;
 }
@@ -34062,12 +34281,34 @@ function countUpperBound(schema, keyword) {
 }
 const CANONICAL_NODE_BUDGET = 20000;
 const OVER_BUDGET = Symbol('canonical-over-budget');
+/** Compositions whose branches may be reordered without changing the meaning. */
+const UNORDERED_LIST_KEYWORDS = new Set(['allOf', 'anyOf', 'oneOf']);
+/** Of those, the ones where repeating a branch changes nothing either. */
+const IDEMPOTENT_LIST_KEYWORDS = new Set(['allOf', 'anyOf']);
+/** Count keywords for which `0` is the same as leaving the keyword out. */
+const ZERO_DEFAULT_KEYWORDS = new Set(['minLength', 'minItems', 'minProperties']);
+/** Boolean keywords for which `false` is the same as leaving the keyword out. */
+const FALSE_DEFAULT_KEYWORDS = new Set(['uniqueItems', 'nullable']);
 /**
- * Builds a stable string for a schema with every internal `$ref` expanded and
- * object keys sorted, so two schemas can be compared for equal meaning rather
- * than equal spelling. A reference that re-enters itself is replaced by a
- * marker naming the pointer, which keeps recursive schemas finite while still
- * distinguishing different targets.
+ * Builds a stable string for a schema with every internal `$ref` expanded, so
+ * two schemas can be compared for equal meaning rather than equal spelling.
+ *
+ * The walk follows the grammar of a schema instead of treating it as a bag of
+ * JSON. Annotations are dropped only where they are keywords; the keys of
+ * `properties` and the other subschema maps are names and are all kept; the
+ * values of `enum`, `const` and every keyword that is not known to hold a
+ * subschema are data, copied whole with nothing dropped and nothing expanded.
+ *
+ * Spellings that provably accept the same instances are folded together:
+ * object key order, the order of `required`, `enum`, `type` and of
+ * `allOf`/`anyOf`/`oneOf` branches, repeated `allOf`/`anyOf` branches,
+ * `nullable: true` against a `"null"` type, and keywords set to the value they
+ * have when absent. Nothing else is: when in doubt two schemas stay different,
+ * which callers report for review.
+ *
+ * A reference that re-enters itself is replaced by a marker naming the pointer,
+ * and the place it was first expanded is marked as well, so a recursive schema
+ * stays finite without two different recursions collapsing into one string.
  *
  * Returns `null` when the schema is too large to canonicalise, which callers
  * must treat as "cannot tell" rather than "equal".
@@ -34081,7 +34322,10 @@ function canonicalize(doc, value) {
     }
     let result;
     try {
-        result = valueKey(canonicalNode(doc, value, new Set(), { left: CANONICAL_NODE_BUDGET }));
+        const state = {
+            doc, activeRefs: new Set(), reentered: new Set(), budget: CANONICAL_NODE_BUDGET,
+        };
+        result = valueKey(canonicalSchema(state, value));
     }
     catch (error) {
         if (error !== OVER_BUDGET)
@@ -34092,50 +34336,134 @@ function canonicalize(doc, value) {
         doc.canonical.set(value, result ?? '');
     return result;
 }
-function canonicalNode(doc, value, activeRefs, budget) {
-    if (--budget.left < 0)
+function spend(state) {
+    if (--state.budget < 0)
         throw OVER_BUDGET;
+}
+/** Plain JSON: keys sorted, nothing dropped, no reference followed. */
+function canonicalData(state, value) {
+    spend(state);
     if (value === null || typeof value !== 'object')
         return value;
     if (Array.isArray(value))
-        return value.map(item => canonicalNode(doc, item, activeRefs, budget));
+        return value.map(item => canonicalData(state, item));
+    const source = value;
+    const data = {};
+    for (const key of Object.keys(source).sort())
+        data[key] = canonicalData(state, source[key]);
+    return data;
+}
+function sortedByKey(values, distinct) {
+    const keyed = values.map(value => ({ key: valueKey(value), value }));
+    keyed.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    return keyed
+        .filter((entry, index) => !distinct || index === 0 || keyed[index - 1].key !== entry.key)
+        .map(entry => entry.value);
+}
+/** A value in schema position: an object, or the boolean schemas `true`/`false`. */
+function canonicalSchema(state, value) {
+    if (value === true) {
+        spend(state);
+        return {};
+    }
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        return canonicalData(state, value);
+    }
+    spend(state);
     const schema = value;
     const ref = schema.$ref;
-    if (typeof ref === 'string') {
-        if (!ref.startsWith('#/'))
-            return { $externalRef: ref };
-        if (activeRefs.has(ref))
-            return { $cyclicRef: ref };
-        let target = doc.root;
+    if (typeof ref !== 'string')
+        return canonicalKeywords(state, schema, {});
+    let resolved;
+    if (!ref.startsWith('#/'))
+        resolved = { $externalRef: ref };
+    else if (state.activeRefs.has(ref)) {
+        state.reentered.add(ref);
+        resolved = { $cyclicRef: ref };
+    }
+    else {
+        let target = state.doc.root;
         for (const key of pointerSegments(ref)) {
             target = record(target)[key];
             if (target === undefined)
-                return { $unresolvedRef: ref };
+                break;
         }
-        activeRefs.add(ref);
-        try {
-            const resolved = canonicalNode(doc, target, activeRefs, budget);
-            const siblings = Object.keys(schema)
-                .filter(key => key !== '$ref' && !exports.ANNOTATION_KEYWORDS.has(key))
-                .sort();
-            if (siblings.length === 0)
-                return resolved;
-            const combined = { $resolved: resolved };
-            for (const key of siblings)
-                combined[key] = canonicalNode(doc, schema[key], activeRefs, budget);
-            return combined;
-        }
-        finally {
-            activeRefs.delete(ref);
+        if (target === undefined)
+            resolved = { $unresolvedRef: ref };
+        else {
+            state.activeRefs.add(ref);
+            try {
+                resolved = canonicalSchema(state, target);
+            }
+            finally {
+                state.activeRefs.delete(ref);
+            }
+            // Mark where a recursion is anchored; a cycle back to this point is not
+            // the same schema as a cycle back to somewhere else.
+            if (state.reentered.delete(ref))
+                resolved = { $recursiveRef: ref, $target: resolved };
         }
     }
-    const canonical = {};
+    const siblings = canonicalKeywords(state, schema, {});
+    if (Object.keys(siblings).length === 0)
+        return resolved;
+    return { $resolved: resolved, ...siblings };
+}
+function canonicalKeywords(state, schema, out) {
+    const types = effectiveTypes(schema);
     for (const key of Object.keys(schema).sort()) {
-        if (exports.ANNOTATION_KEYWORDS.has(key))
+        if (key === '$ref' || exports.ANNOTATION_KEYWORDS.has(key))
             continue;
-        canonical[key] = canonicalNode(doc, schema[key], activeRefs, budget);
+        const value = schema[key];
+        if (types.size > 0 && (key === 'type' || key === 'nullable')) {
+            // Every integer is a number, so naming both adds nothing.
+            if (key === 'type')
+                out.type = [...types].filter(type => type !== 'integer' || !types.has('number')).sort();
+            continue;
+        }
+        if (ZERO_DEFAULT_KEYWORDS.has(key) && value === 0)
+            continue;
+        if (FALSE_DEFAULT_KEYWORDS.has(key) && value === false)
+            continue;
+        if (exports.SUBSCHEMA_MAP_KEYWORDS.has(key) && isPlainObject(value)) {
+            const map = {};
+            for (const name of Object.keys(value).sort())
+                map[name] = canonicalSchema(state, value[name]);
+            out[key] = map;
+        }
+        else if ((exports.SUBSCHEMA_LIST_KEYWORDS.has(key) || key === 'items') && Array.isArray(value)) {
+            const branches = value.map(item => canonicalSchema(state, item));
+            out[key] = UNORDERED_LIST_KEYWORDS.has(key)
+                ? sortedByKey(branches, IDEMPOTENT_LIST_KEYWORDS.has(key))
+                : branches;
+        }
+        else if (exports.SUBSCHEMA_KEYWORDS.has(key)) {
+            out[key] = canonicalSchema(state, value);
+        }
+        else if (key === 'dependencies' && isPlainObject(value)) {
+            // Draft-04 style: a name maps to either a schema or a list of names.
+            const map = {};
+            for (const name of Object.keys(value).sort()) {
+                const entry = value[name];
+                map[name] = Array.isArray(entry) ? canonicalData(state, entry) : canonicalSchema(state, entry);
+            }
+            out[key] = map;
+        }
+        else if (key === 'required' && Array.isArray(value) && value.every(item => typeof item === 'string')) {
+            if (value.length > 0)
+                out[key] = sortedByKey(value, true);
+        }
+        else if (key === 'enum' && Array.isArray(value)) {
+            out[key] = sortedByKey(value.map(item => canonicalData(state, item)), true);
+        }
+        else {
+            out[key] = canonicalData(state, value);
+        }
     }
-    return canonical;
+    return out;
+}
+function isPlainObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 

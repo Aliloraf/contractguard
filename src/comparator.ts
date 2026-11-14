@@ -21,6 +21,7 @@ import {
   permits,
   record,
   resolve,
+  resolveSchema,
   strings,
   valueKey,
 } from './schema';
@@ -44,8 +45,10 @@ const MAX_SCHEMA_DEPTH = 64;
  * Validation keywords that affect compatibility but cannot be compared
  * reliably: `pattern` would need regular expression inclusion analysis,
  * `format` needs a registry of value spaces, and the rest need instance-level
- * reasoning. A change to any of them is surfaced as a notice rather than
- * passed over as compatible.
+ * reasoning. `discriminator` does not validate anything, but it tells clients
+ * which alternative a payload is, so changing it changes how the same payload
+ * is read. A change to any of them is surfaced as a notice rather than passed
+ * over as compatible.
  */
 const UNCOMPARED_CONSTRAINTS = [
   'multipleOf',
@@ -70,6 +73,9 @@ const UNCOMPARED_CONSTRAINTS = [
   'if',
   'then',
   'else',
+  'additionalItems',
+  'dependencies',
+  'discriminator',
 ] as const;
 
 /**
@@ -282,7 +288,8 @@ function compareUnions(
         `\`${keyword}\` was ${oldDeclared ? 'removed' : 'added'}; whether the same instances are still accepted cannot be established. Review this subschema manually.`);
       continue;
     }
-    const delta = compareBranchLists(before, oldBranches as unknown[], after, newBranches as unknown[]);
+    const delta = compareBranchLists(
+      before, oldBranches as unknown[], after, newBranches as unknown[], keyword === 'anyOf');
     if (delta === 'unchanged') continue;
     if (keyword === 'anyOf' && direction === 'request' && delta === 'added') continue;
     if (keyword === 'anyOf' && direction === 'response' && delta === 'removed') continue;
@@ -297,7 +304,8 @@ function noteUnevaluatedKeywords(
   location: string,
   report: Reporter,
 ): void {
-  if ('prefixItems' in oldSchema || 'prefixItems' in newSchema) {
+  if ('prefixItems' in oldSchema || 'prefixItems' in newSchema
+    || Array.isArray(oldSchema.items) || Array.isArray(newSchema.items)) {
     report.notice('UNSUPPORTED_TUPLE_ITEMS', location,
       'Tuple validation (`prefixItems`) is not evaluated; review positional array changes manually.');
   }
@@ -310,40 +318,118 @@ function describeConstraint(value: unknown): string {
 }
 
 /**
- * Reports validation keywords that changed but cannot be evaluated, so a clean
- * breaking list is never mistaken for proof that the constraint still holds.
- * An unchanged keyword cannot affect compatibility, so it stays quiet.
+ * The meaning of one keyword, with the references inside it expanded. Comparing
+ * the keyword as written would miss a change to a schema it only points at.
+ * `null` means the keyword is too large to canonicalise.
  */
-function noteChangedConstraints(
+function constraintMeaning(doc: Document, keyword: string, value: unknown): string | null {
+  return canonicalize(doc, value === undefined ? {} : { [keyword]: value });
+}
+
+function sameConstraint(
+  before: Document,
+  after: Document,
+  keyword: string,
+  oldValue: unknown,
+  newValue: unknown,
+): boolean {
+  const left = constraintMeaning(before, keyword, oldValue);
+  const right = constraintMeaning(after, keyword, newValue);
+  return left !== null && right !== null && left === right;
+}
+
+/**
+ * What `additionalProperties` says about undeclared properties: nothing
+ * (`open`, also the meaning of leaving it out), that there are none (`closed`),
+ * or that they must match a schema.
+ */
+type Extras = 'open' | 'closed' | 'schema';
+
+function extrasKind(doc: Document, value: unknown): Extras {
+  if (value === undefined || value === true) return 'open';
+  if (value === false) return 'closed';
+  return canonicalize(doc, value) === '{}' ? 'open' : 'schema';
+}
+
+/**
+ * Undeclared properties follow the same direction rule as everything else, but
+ * a subschema cannot be compared against "anything goes", so the transitions
+ * that are not provably safe are reported for review. Closing a request object
+ * is reported as breaking by the caller; a response that starts allowing
+ * undeclared properties adds fields, which clients are expected to tolerate.
+ */
+function noteAdditionalProperties(
+  before: Document,
+  after: Document,
   oldSchema: JsonObject,
   newSchema: JsonObject,
   location: string,
+  direction: Direction,
+  report: Reporter,
+): void {
+  if (!constraintApplies(oldSchema, newSchema, ['object'])) return;
+  const oldExtras = oldSchema.additionalProperties;
+  const newExtras = newSchema.additionalProperties;
+  const was = extrasKind(before, oldExtras);
+  const now = extrasKind(after, newExtras);
+
+  if (was === 'schema' && now === 'schema') {
+    if (!sameConstraint(before, after, 'additionalProperties', oldExtras, newExtras)) {
+      report.notice('CONSTRAINT_NOT_COMPARED', location,
+        'The `additionalProperties` subschema changed; undeclared property compatibility was not evaluated.');
+    }
+    return;
+  }
+  if (direction === 'request' && was === 'open' && now === 'schema') {
+    report.notice('CONSTRAINT_NOT_COMPARED', location,
+      'An `additionalProperties` subschema was introduced; undeclared properties that were accepted as anything must now match it, and which requests are rejected was not evaluated.');
+  }
+  if (direction === 'response' && was === 'schema' && now === 'open') {
+    report.notice('CONSTRAINT_NOT_COMPARED', location,
+      'The `additionalProperties` subschema was removed; undeclared properties may now hold any value, and whether clients reading them still cope was not evaluated.');
+  }
+}
+
+/**
+ * Reports validation keywords that changed but cannot be evaluated, so a clean
+ * breaking list is never mistaken for proof that the constraint still holds.
+ * An unchanged keyword cannot affect compatibility, so it stays quiet. Change
+ * is judged on meaning: a keyword spelled the same on both sides has still
+ * changed when a schema it references has.
+ */
+function noteChangedConstraints(
+  before: Document,
+  after: Document,
+  oldSchema: JsonObject,
+  newSchema: JsonObject,
+  location: string,
+  direction: Direction,
   report: Reporter,
 ): void {
   for (const keyword of UNCOMPARED_CONSTRAINTS) {
-    const before = oldSchema[keyword];
-    const after = newSchema[keyword];
-    if (before === undefined && after === undefined) continue;
-    if (valueKey(before) === valueKey(after)) continue;
+    const oldValue = oldSchema[keyword];
+    const newValue = newSchema[keyword];
+    if (oldValue === undefined && newValue === undefined) continue;
+    if (sameConstraint(before, after, keyword, oldValue, newValue)) continue;
+    const change = valueKey(oldValue) === valueKey(newValue)
+      ? 'changed through a schema it references'
+      : `changed (${describeConstraint(oldValue)} → ${describeConstraint(newValue)})`;
     report.notice('CONSTRAINT_NOT_COMPARED', location,
-      `\`${keyword}\` changed (${describeConstraint(before)} → ${describeConstraint(after)}); this constraint is not evaluated and must be reviewed manually.`);
+      `\`${keyword}\` ${change}; this constraint is not evaluated and must be reviewed manually.`);
   }
-  const beforeExtras = oldSchema.additionalProperties;
-  const afterExtras = newSchema.additionalProperties;
-  if (typeof beforeExtras === 'object' && beforeExtras !== null
-    && typeof afterExtras === 'object' && afterExtras !== null
-    && valueKey(beforeExtras) !== valueKey(afterExtras)) {
-    report.notice('CONSTRAINT_NOT_COMPARED', location,
-      'The `additionalProperties` subschema changed; undeclared property compatibility was not evaluated.');
-  }
+  noteAdditionalProperties(before, after, oldSchema, newSchema, location, direction, report);
+}
+
+function describeBoolean(raw: unknown): string {
+  return typeof raw === 'boolean' ? `\`${raw}\`` : 'a schema';
 }
 
 /** True when both schemas mean the same thing once references are expanded. */
 function sameMeaning(
   before: Document,
-  oldSchema: JsonObject,
+  oldSchema: unknown,
   after: Document,
-  newSchema: JsonObject,
+  newSchema: unknown,
 ): boolean {
   const left = canonicalize(before, oldSchema);
   const right = canonicalize(after, newSchema);
@@ -361,8 +447,18 @@ function compareSchema(
   seen: WeakMap<object, WeakSet<object>>,
   depth: number,
 ): void {
-  const oldResolved = resolve(before.root, oldRaw);
-  const newResolved = resolve(after.root, newRaw);
+  // The boolean schemas accept everything or nothing. They carry no keywords
+  // to compare, so anything but an unchanged meaning is left for review.
+  if (typeof oldRaw === 'boolean' || typeof newRaw === 'boolean') {
+    if (!sameMeaning(before, oldRaw, after, newRaw)) {
+      report.notice('SCHEMA_NOT_COMPARED', location,
+        `A boolean schema is involved (${describeBoolean(oldRaw)} → ${describeBoolean(newRaw)}); this subschema was not compared.`);
+    }
+    return;
+  }
+
+  const oldResolved = resolveSchema(before, oldRaw);
+  const newResolved = resolveSchema(after, newRaw);
   const visited = seen.get(oldResolved);
   if (visited?.has(newResolved)) return;
   if (visited) visited.add(newResolved);
@@ -391,7 +487,7 @@ function compareSchema(
   const newSchema = newFlat.schema;
 
   noteUnevaluatedKeywords(oldSchema, newSchema, location, report);
-  noteChangedConstraints(oldSchema, newSchema, location, report);
+  noteChangedConstraints(before, after, oldSchema, newSchema, location, direction, report);
   compareUnions(before, after, oldSchema, newSchema, location, direction, report);
   compareTypes(oldSchema, newSchema, location, direction, report);
   compareEnums(oldSchema, newSchema, location, direction, report);
@@ -413,18 +509,29 @@ function compareSchema(
       report.breaking('REQUEST_OBJECT_CLOSED', location,
         'Object now rejects undeclared properties (additionalProperties: false); requests carrying extra fields are refused.');
     }
+    const newExtras = extrasKind(after, newSchema.additionalProperties);
     for (const name of Object.keys(oldProperties)) {
-      if (!(name in newProperties) && isClosedObject(newSchema)) {
+      if (name in newProperties) continue;
+      if (newExtras === 'closed') {
         report.breaking('REQUEST_FIELD_REMOVED', `${location}.${name}`, 'Previously accepted field removed from a closed object schema.');
+      } else if (newExtras === 'schema') {
+        // The field is still accepted, but as an undeclared property.
+        report.notice('CONSTRAINT_NOT_COMPARED', `${location}.${name}`,
+          'Field is no longer declared, so it now has to match the `additionalProperties` subschema; whether its former values still do was not evaluated.');
       }
     }
   } else {
     for (const name of Object.keys(oldProperties)) {
       if (!(name in newProperties)) {
         report.breaking('RESPONSE_FIELD_REMOVED', `${location}.${name}`, 'Response field removed.');
-      } else if (oldRequired.has(name) && !newRequired.has(name)) {
-        report.breaking('RESPONSE_FIELD_OPTIONAL', `${location}.${name}`, 'Previously guaranteed response field is now optional.');
       }
+    }
+    // `required` guarantees presence whether or not the name is also declared
+    // under `properties`, so the guarantee is read from `required` alone.
+    for (const name of oldRequired) {
+      if (newRequired.has(name)) continue;
+      if (name in oldProperties && !(name in newProperties)) continue;
+      report.breaking('RESPONSE_FIELD_OPTIONAL', `${location}.${name}`, 'Previously guaranteed response field is now optional.');
     }
   }
 
@@ -437,7 +544,9 @@ function compareSchema(
 
   const oldItems = oldSchema.items;
   const newItems = newSchema.items;
-  if (oldItems !== undefined && newItems !== undefined) {
+  if (Array.isArray(oldItems) || Array.isArray(newItems)) {
+    // Positional items: already reported as unevaluated tuple validation.
+  } else if (oldItems !== undefined && newItems !== undefined) {
     compareSchema(before, after, oldItems, newItems, `${location}[]`, direction, report, seen, depth + 1);
   } else if (oldItems !== undefined || newItems !== undefined) {
     report.notice('SCHEMA_NOT_COMPARED', `${location}[]`,

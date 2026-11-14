@@ -1,5 +1,5 @@
 import type { JsonObject, Reporter } from './types';
-import { Document, effectiveTypes, record, resolve, valueKey } from './schema';
+import { Document, effectiveTypes, record, resolve, resolveSchema, valueKey } from './schema';
 import { flattenAllOf } from './composition';
 
 /**
@@ -132,8 +132,8 @@ type ObjectValues = 'possible' | 'impossible' | 'unknown';
 const UNDECIDED_KEYWORDS = ['anyOf', 'oneOf', 'not', 'if', 'then', 'else', 'enum', 'const'] as const;
 
 function objectValues(doc: Document, rawSchema: unknown): ObjectValues {
-  if (rawSchema === undefined) return 'unknown';
-  const flat = flattenAllOf(doc, resolve(doc.root, rawSchema));
+  if (rawSchema === undefined || typeof rawSchema === 'boolean') return 'unknown';
+  const flat = flattenAllOf(doc, resolveSchema(doc, rawSchema));
   if (!flat.exact) return 'unknown';
   const types = effectiveTypes(flat.schema);
   if (types.size === 0) return 'unknown';
