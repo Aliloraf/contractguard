@@ -6,6 +6,69 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While on `0.x`, a minor
 release may change what the engine reports, so workflows should pin an exact release tag.
 
+## [Unreleased]
+
+### Added
+
+**Response header compatibility.** Headers are compared on every response, matched by name
+without regard to case, with `$ref`s to `components.headers` resolved on each side and
+`Content-Type` ignored as OpenAPI requires. Header schemas go through the existing schema
+engine in the response direction, so type, `enum`, range, length, item-count, `allOf` and
+`$ref` handling are the same as for bodies, at locations such as
+`GET /orders 429 response header Retry-After`. A header described by `content` is compared
+through its media type schema.
+
+New breaking rule codes:
+
+- `RESPONSE_HEADER_REMOVED` — a documented response header is gone
+- `RESPONSE_HEADER_OPTIONAL` — a `required: true` response header is now optional
+- `RESPONSE_HEADER_SERIALIZATION_CHANGED` — `explode` changed on an object-valued header
+
+**Error, range and `default` responses.** Every documented response is now compared, not
+only `2xx`. `4xx`/`5xx` codes, `nXX` ranges and `default` are held to the same body and
+header rules, reusing the existing codes (`RESPONSE_FIELD_REMOVED`, `SCHEMA_TYPE_CHANGED`,
+`MEDIA_TYPE_REMOVED`, …).
+
+**Status keys resolved the way OpenAPI defines them.** A status documented on one side only
+is matched to the entry that describes it on the other side — an explicit code, then its
+`nXX` range, then `default` — and the two definitions are compared. A change that keeps
+every promise (errors consolidated into an identical range, a status split out of `default`
+unchanged) is compatible. Anything else is a review notice, never a verdict, because a
+document does not say which statuses an operation really returns.
+
+New review notices:
+
+- `RESPONSE_STATUS_ADDED` — a status, range or `default` documented where nothing described
+  it before
+- `RESPONSE_STATUS_REMOVED` — a non-success status, range or `default` gone with nothing
+  left to describe it
+- `RESPONSE_COVERAGE_CHANGED` — a status now described by a different entry whose definition
+  could not be shown to keep what the old one promised
+- `HEADER_NOT_COMPARED` — a header change that is not evaluated: `style`, `explode` on a
+  value of unestablished type, a switch between `schema` and `content`, a field outside the
+  Header Object, or a name declared twice under different capitalisation
+
+### Changed
+
+- `SUCCESS_RESPONSE_REMOVED` is no longer raised when a removed `2xx` code is described by a
+  `2XX` range that keeps everything it promised. It is now also raised for a removed `2XX`
+  range that leaves no success response behind. A `default` response never stands in for a
+  removed success response.
+- `MEDIA_TYPE_REMOVED`, `SCHEMA_NOT_COMPARED` and the schema rules now also apply to
+  non-`2xx` responses and to response headers.
+- External or unresolvable `$ref`s inside non-`2xx` responses and response headers are now
+  rejected with the same error as anywhere else; previously those parts were never read.
+- **Upgrade note:** changes to error responses and response headers that used to go
+  unreported can now fail the check, and newly documented or removed statuses now raise
+  notices. Exit codes and Action outputs are unchanged in meaning.
+
+### Known limitations
+
+Media types are matched literally (no ranges, parameters or case folding), response `links`
+are not compared, header `style` values other than `simple` are reported rather than
+evaluated, and differences found while matching a status to a range or `default` are
+summarised in one notice. See the README.
+
 ## [0.1.0] - 2026-11-04
 
 First public release.
@@ -84,4 +147,5 @@ checker. It does not evaluate external or multi-file `$ref`, `anyOf`/`oneOf` sub
 `callbacks` or `security` semantics. See the README for the full list and for what each notice
 means.
 
+[Unreleased]: https://github.com/Aliloraf/contractguard/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Aliloraf/contractguard/releases/tag/v0.1.0

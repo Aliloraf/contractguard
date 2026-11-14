@@ -674,3 +674,67 @@ test('every documented output is set on a successful run', async () => {
   const { io } = await run({ files: { files: { [`${ROOT}/${SPEC}`]: NOTICE_ONLY_SPEC } } });
   assert.deepEqual(Object.keys(io.record.outputs).sort(), ['breaking', 'breaking-count', 'notice-count']);
 });
+
+// --- Response headers and error responses through the Action -----------------
+
+/** The base document with a response header and a documented error. */
+function responseSpec({ header = true, errorFields = ['code', 'message'], extraStatus } = {}) {
+  return [
+    'openapi: 3.0.3',
+    'info: { title: Users, version: 1.0.0 }',
+    'paths:',
+    '  /users:',
+    '    get:',
+    '      responses:',
+    "        '200':",
+    '          description: ok',
+    ...(header ? ['          headers:', '            X-Request-Id: { required: true, schema: { type: string } }'] : []),
+    "        '404':",
+    '          description: missing',
+    '          content:',
+    '            application/json:',
+    '              schema:',
+    '                type: object',
+    `                properties: { ${errorFields.map(name => `${name}: { type: string }`).join(', ')} }`,
+    ...(extraStatus ? [`        '${extraStatus}':`, '          description: extra'] : []),
+    '',
+  ].join('\n');
+}
+
+test('a removed response header fails the check like any breaking change', async () => {
+  const { outcome, io } = await run({
+    git: { commits: { [BASE_SHA]: { [SPEC]: responseSpec() }, [HEAD_SHA]: {} } },
+    files: { files: { [`${ROOT}/${SPEC}`]: responseSpec({ header: false }) } },
+  });
+  assert.equal(outcome.status, 'breaking');
+  assert.equal(outcome.breakingCount, 1);
+  assert.equal(outcome.noticeCount, 0);
+  assert.equal(io.record.outputs.breaking, 'true');
+  assert.equal(io.record.outputs['breaking-count'], '1');
+  assert.match(io.record.summary[0], /`RESPONSE_HEADER_REMOVED` \| `GET \/users 200 response header X-Request-Id`/);
+});
+
+test('a changed error body fails the check', async () => {
+  const { outcome, io } = await run({
+    git: { commits: { [BASE_SHA]: { [SPEC]: responseSpec() }, [HEAD_SHA]: {} } },
+    files: { files: { [`${ROOT}/${SPEC}`]: responseSpec({ errorFields: ['code'] }) } },
+  });
+  assert.equal(outcome.status, 'breaking');
+  assert.equal(io.record.outputs['breaking-count'], '1');
+  assert.match(io.record.summary[0], /`RESPONSE_FIELD_REMOVED` \| `GET \/users 404 response \[application\/json\]\.message`/);
+});
+
+test('a newly documented error status passes the check but asks for a review', async () => {
+  const { outcome, io } = await run({
+    git: { commits: { [BASE_SHA]: { [SPEC]: responseSpec() }, [HEAD_SHA]: {} } },
+    files: { files: { [`${ROOT}/${SPEC}`]: responseSpec({ extraStatus: '429' }) } },
+  });
+  assert.equal(outcome.status, 'compatible');
+  assert.equal(outcome.breakingCount, 0);
+  assert.equal(outcome.noticeCount, 1);
+  assert.deepEqual(io.record.failed, []);
+  assert.equal(io.record.outputs.breaking, 'false');
+  assert.equal(io.record.outputs['notice-count'], '1');
+  assert.ok(io.record.warning.some(w => /manual review/.test(w)));
+  assert.match(io.record.summary[0], /`RESPONSE_STATUS_ADDED` \| `GET \/users 429`/);
+});
