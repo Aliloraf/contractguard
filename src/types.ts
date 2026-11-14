@@ -16,3 +16,11 @@ export interface ComparisonResult {
   notices: Finding[];
   checkedOperations: number;
 }
+
+/** Where a rule sends what it finds. */
+export interface Reporter {
+  /** A change that can break existing clients. */
+  breaking(code: string, location: string, message: string): void;
+  /** A place the rule set could not evaluate; never fails the check on its own. */
+  notice(code: string, location: string, message: string): void;
+}

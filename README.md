@@ -53,9 +53,9 @@ npm run cli -- --base examples/before.yaml --head examples/after.yaml
 
 | | |
 | --- | --- |
-| **Catches** | removed operations, parameters, success responses and media types; newly required parameters, bodies and fields; request enums narrowed; response enums widened; numeric, length and item-count ranges tightened for requests or relaxed for responses; objects closed to extra properties; response fields removed or made optional; type changes, directionally, with `integer` understood as part of `number` |
-| **Understands** | OpenAPI 3.0 and 3.1, YAML and JSON, internal `$ref` (including recursion), nested objects and arrays, and `allOf` wherever it can be merged without changing meaning |
-| **Reports for review instead of guessing** | `anyOf`/`oneOf` changes whose effect depends on overlapping alternatives, `allOf` that cannot be merged safely, `pattern`, `format`, `multipleOf` and other constraints needing instance-level reasoning, and changed `security` requirements |
+| **Catches** | removed operations, parameters, success responses and media types; newly required parameters, bodies and fields; request enums narrowed; response enums widened; numeric, length and item-count ranges tightened for requests or relaxed for responses; objects closed to extra properties; response fields removed or made optional; type changes, directionally, with `integer` understood as part of `number`; authentication made mandatory, extra security schemes or OAuth2/OpenID Connect scopes required, and accepted authentication alternatives removed |
+| **Understands** | OpenAPI 3.0 and 3.1, YAML and JSON, internal `$ref` (including recursion), nested objects and arrays, `allOf` wherever it can be merged without changing meaning, and `security` as an access rule: document defaults, operation overrides, `security: []`, optional authentication, alternatives (OR) and combined schemes (AND) |
+| **Reports for review instead of guessing** | `anyOf`/`oneOf` changes whose effect depends on overlapping alternatives, `allOf` that cannot be merged safely, `pattern`, `format`, `multipleOf` and other constraints needing instance-level reasoning, and `security` changes that hinge on a renamed, redefined or undefined scheme |
 | **Does not check** | external or multi-file `$ref`, non-`2xx` responses, response headers, `servers`, `webhooks`, `callbacks`, or anything else in [the limitations](#what-the-engine-does-not-support) |
 
 A clean report is not a proof of compatibility. Everything the engine cannot evaluate is
@@ -94,6 +94,10 @@ Every finding carries a stable rule code:
 | `REQUEST_FIELD_REMOVED` | A property was dropped from a request schema with `additionalProperties: false`. |
 | `RESPONSE_FIELD_REMOVED` | A `2xx` response property was removed. |
 | `RESPONSE_FIELD_OPTIONAL` | A previously guaranteed (`required`) response property is now optional. |
+| `SECURITY_AUTHENTICATION_REQUIRED` | An operation that accepted unauthenticated requests now requires credentials. |
+| `SECURITY_SCHEME_REQUIRED` | A security requirement that used to suffice must now be combined with a further scheme. |
+| `SECURITY_SCOPE_REQUIRED` | An OAuth2 or OpenID Connect requirement now demands scopes it did not demand before. |
+| `SECURITY_ALTERNATIVE_REMOVED` | A previously accepted authentication alternative is gone, and no remaining alternative is satisfied by the same credentials. |
 
 Rules apply at every depth: nested objects, array elements (reported as `path[]`), parameter
 schemas and request/response bodies, with locations such as
@@ -202,6 +206,61 @@ already covered), **every** `oneOf` change (because "exactly one must match" mea
 alternative can invalidate instances that were valid before, whenever alternatives overlap),
 and a union added or removed on one side only.
 
+## Security requirements
+
+`security` is compared as an **access rule**, not as an array. For each operation the engine
+works out the requirements that actually apply, then asks one question: *is every set of
+credentials that used to be accepted still accepted?*
+
+**Effective requirements.** An operation's own `security` replaces the document-level
+`security`; an operation without one inherits the document default. `security: []` switches
+the default off, and no declaration at either level means the operation is unsecured.
+
+**Reading a requirement.** The entries of a `security` list are alternatives — satisfying
+any one is enough (OR). The schemes inside one entry must all be satisfied (AND), and for an
+OAuth2 or OpenID Connect scheme every listed scope must be granted. An empty entry `{}`
+admits unauthenticated requests, which is how optional authentication is written.
+
+**The rule.** A change is compatible when each old alternative is still satisfied by at
+least one new alternative: one that asks for no scheme the old alternative lacked and no
+scope it lacked. Otherwise the alternative that lost its match is reported, once:
+
+| Change | Result |
+| --- | --- |
+| Unsecured, or optional (`{}`), and now every alternative needs credentials | `SECURITY_AUTHENTICATION_REQUIRED` |
+| `apiKey` → `apiKey` + `bearer` in the same entry | `SECURITY_SCHEME_REQUIRED` |
+| `oauth: [read]` → `oauth: [read, write]` | `SECURITY_SCOPE_REQUIRED` |
+| `apiKey` or `oauth` → `oauth` only, or `apiKey` swapped for a different scheme | `SECURITY_ALTERNATIVE_REMOVED` |
+| Security removed, `{}` added, an alternative added, a scope or a combined scheme dropped | compatible |
+| Alternatives, schemes or scopes reordered or repeated; `[]` vs `[{}]` vs no declaration; a requirement moved between the document and its operations | no change |
+| An alternative removed that a weaker remaining one already covers (`oauth: [read]` kept, `oauth: [read, write]` removed) | compatible |
+
+A change to the document-level `security` is reported on every operation that inherits it,
+because each of those operations is affected; operations with their own `security` are not.
+
+**Scheme identity is never assumed.** A verdict is only given when
+`components.securitySchemes` shows what the schemes are. A scheme name means the same thing
+on both sides only if its definition is unchanged for a client — `description`, an added
+OAuth2 flow or an added available scope do not count as changes. Two differently named
+schemes are treated as different credentials only when the documents show it. Everything
+else raises `SECURITY_NOT_COMPARED` instead of a verdict:
+
+- a requirement names a scheme that is not defined, has an unsupported `type`, or whose
+  definition cannot be resolved;
+- a scheme's definition changed (type, `in`/`name`, HTTP scheme, OAuth2 endpoints, a removed
+  flow or scope, `openIdConnectUrl`) while operations still require it — reported once per
+  scheme, at `components.securitySchemes.<name>`;
+- a scheme was replaced by a new one of the same kind, which may be a rename, or by one
+  that is defined exactly like it;
+- the list attached to a scheme that is not OAuth2 or OpenID Connect changed (OpenAPI 3.1
+  role names have no defined meaning);
+- `security` is not a list of requirement objects.
+
+An established break on one alternative and an inconclusive result on another are reported
+side by side. The analysis models whether a request is *admitted*; it does not model what
+an authenticated caller is entitled to, so removing an authenticated alternative while
+unauthenticated access remains is treated as compatible.
+
 ## Review-required notices
 
 Silently skipping a construct the engine cannot evaluate would make a clean report
@@ -213,7 +272,7 @@ check and **do not** change the CLI exit code; they tell you where a human still
 | `UNSUPPORTED_COMPOSITION` | A composed schema could not be analysed: an `allOf` that cannot be merged without changing its meaning, or an `anyOf`/`oneOf` change whose effect depends on whether alternatives overlap. The message names the reason. |
 | `UNSUPPORTED_TUPLE_ITEMS` | `prefixItems` (3.1 tuple validation) is present and is not evaluated. |
 | `SCHEMA_NOT_COMPARED` | One side of a pair declares a schema and the other does not (media type, array `items`, parameter), or a parameter uses `content` serialisation. |
-| `SECURITY_NOT_COMPARED` | The operation's effective `security` requirements changed; authentication compatibility is not analysed. |
+| `SECURITY_NOT_COMPARED` | A `security` change could not be decided: it depends on a scheme that is undefined, unsupported, renamed or redefined, on a role list for a scheme without scopes, or on a malformed `security` value. Also raised once per scheme, at `components.securitySchemes.<name>`, when a definition changed underneath operations that still require it. See [Security requirements](#security-requirements). |
 | `CONSTRAINT_NOT_COMPARED` | A validation keyword that cannot be evaluated reliably changed: `pattern`, `format`, `multipleOf`, `uniqueItems`, `contains`/`minContains`/`maxContains`, `minProperties`/`maxProperties`, `patternProperties`, `propertyNames`, `dependentRequired`/`dependentSchemas`, `const`, `readOnly`/`writeOnly`, `unevaluatedProperties`/`unevaluatedItems`, or an `additionalProperties` subschema. Unchanged keywords stay quiet, since they cannot affect compatibility. |
 
 ## What the engine does **not** support
@@ -230,8 +289,14 @@ check and **do not** change the CLI exit code; they tell you where a human still
 - **Schema nesting past 64 levels** is reported as not compared, as a guard against a schema
   graph that defeats the cycle checks.
 - **`prefixItems` / tuple validation** — flagged via `UNSUPPORTED_TUPLE_ITEMS`, not compared.
-- **`security` scheme semantics** — a change is flagged via `SECURITY_NOT_COMPARED`, but
-  scopes and scheme types are not analysed.
+- **Security scheme definitions** — requirements are compared, definitions are not. A
+  changed definition (an API key moved to another header, a different token endpoint, a
+  removed OAuth2 flow) is flagged via `SECURITY_NOT_COMPARED`, never judged breaking or
+  compatible. Renamed schemes are not matched up, and OpenAPI 3.1 role lists on schemes
+  other than OAuth2 and OpenID Connect are not interpreted.
+- **Authorization beyond the declared requirements** — what a scope or an identity is
+  entitled to, scope hierarchies (a broader scope implying a narrower one) and
+  vendor-specific security extensions are outside the model.
 - **Non-`2xx` responses** — error responses and response headers are not compared.
 - **Constraints that need instance-level or language-level reasoning** are not evaluated:
   `pattern` (no regular expression inclusion analysis is attempted), `format`, `multipleOf`,
@@ -521,8 +586,8 @@ end-to-end behaviour on GitHub is worth confirming once per release:
 
 1. **v0.1** — comparison engine, CLI, bundled GitHub Action, unit tests *(done)*.
 2. **v0.2** — directional type/enum rules, numeric/string/array/object constraints, safe
-   `allOf` merging, provable `anyOf`/`oneOf` cases, explicit review-required notices
-   *(current)*; still to come: `anyOf`/`oneOf` subsumption analysis, broader third-party
+   `allOf` merging, provable `anyOf`/`oneOf` cases, directional `security` requirement
+   analysis, explicit review-required notices *(current)*; still to come: `anyOf`/`oneOf` subsumption analysis, broader third-party
    fixtures.
 3. **v0.3** — inline PR annotations, ignore/config rules, JSON diff export, multi-file `$ref`,
    multiple specification paths per run.

@@ -6,6 +6,47 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While on `0.x`, a minor
 release may change what the engine reports, so workflows should pin an exact release tag.
 
+## [Unreleased]
+
+### Added
+
+**Directional security requirement analysis.** `security` is now compared as an access rule
+instead of being flagged whenever it changed. The engine resolves each operation's effective
+requirements — the document default, an operation override, an explicit `security: []` — and
+checks that every previously accepted requirement is still satisfied by at least one
+alternative, reading the list as alternatives (OR), the schemes in one entry as a
+combination (AND), `{}` as optional authentication, and OAuth2 and OpenID Connect scope lists
+as required scopes.
+
+New breaking rule codes:
+
+- `SECURITY_AUTHENTICATION_REQUIRED` — an operation that accepted unauthenticated requests
+  now requires credentials
+- `SECURITY_SCHEME_REQUIRED` — a requirement that used to suffice must now be combined with a
+  further scheme
+- `SECURITY_SCOPE_REQUIRED` — an OAuth2 or OpenID Connect requirement demands additional
+  scopes
+- `SECURITY_ALTERNATIVE_REMOVED` — an accepted authentication alternative is gone and no
+  remaining alternative is satisfied by the same credentials
+
+Relaxations (security removed, an alternative added, a scope or combined scheme dropped) and
+equivalent spellings (reordering, repetition, `[]` versus `[{}]`, a requirement moved between
+the document and its operations) are recognised as compatible and reported as nothing.
+
+### Changed
+
+- `SECURITY_NOT_COMPARED` is no longer raised for every `security` change. It is kept for
+  changes that cannot be decided: a scheme that is undefined, of an unsupported type,
+  renamed, or redefined; a changed role list on a scheme without scopes; a malformed
+  `security` value. Its message now names the reason.
+- A security scheme whose definition changed while operations still require it raises one
+  `SECURITY_NOT_COMPARED` notice at `components.securitySchemes.<name>`. Previously such a
+  change was not reported at all when the requirements themselves were untouched.
+- A `security` value that is not a list is reported rather than skipped in favour of the
+  document default.
+- **Upgrade note:** security changes that used to produce only a notice can now fail the
+  check. Exit codes and Action outputs are unchanged in meaning.
+
 ## [0.1.0] - 2026-11-04
 
 First public release.
@@ -84,4 +125,5 @@ checker. It does not evaluate external or multi-file `$ref`, `anyOf`/`oneOf` sub
 `callbacks` or `security` semantics. See the README for the full list and for what each notice
 means.
 
+[Unreleased]: https://github.com/Aliloraf/contractguard/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Aliloraf/contractguard/releases/tag/v0.1.0

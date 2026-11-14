@@ -1,4 +1,4 @@
-import type { ComparisonResult, Finding, JsonObject } from './types';
+import type { ComparisonResult, Finding, JsonObject, Reporter } from './types';
 import {
   Bound,
   Document,
@@ -25,6 +25,7 @@ import {
   valueKey,
 } from './schema';
 import { BranchDelta, compareBranchLists, flattenAllOf } from './composition';
+import { compareSecurity, reportSchemeChanges, securityContext } from './security';
 
 const METHODS = ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace'] as const;
 
@@ -75,13 +76,6 @@ const UNCOMPARED_CONSTRAINTS = [
  * a response schema may only get more restrictive.
  */
 type Direction = 'request' | 'response';
-
-interface Reporter {
-  /** A change that can break existing clients. */
-  breaking(code: string, location: string, message: string): void;
-  /** A place the rule set could not evaluate; never fails the check on its own. */
-  notice(code: string, location: string, message: string): void;
-}
 
 const RANGE_RULES = {
   range: { narrowed: 'REQUEST_RANGE_NARROWED', widened: 'RESPONSE_RANGE_WIDENED' },
@@ -497,15 +491,6 @@ function parameterMap(root: JsonObject, pathItem: JsonObject, operation: JsonObj
   return map;
 }
 
-/** Operation-level `security` overrides the document default; '' means none. */
-function effectiveSecurity(root: JsonObject, operation: JsonObject): string {
-  const declared = Array.isArray(operation.security) ? operation.security
-    : Array.isArray(root.security) ? root.security
-      : undefined;
-  if (!declared) return '';
-  return declared.map(entry => valueKey(entry)).sort().join(' ; ');
-}
-
 function compareParameters(
   before: Document,
   after: Document,
@@ -554,6 +539,7 @@ export function compareSpecifications(oldRoot: JsonObject, newRoot: JsonObject):
   };
   const report: Reporter = { breaking: collect(breaking), notice: collect(notices) };
 
+  const security = securityContext(oldRoot, newRoot);
   const oldPaths = record(oldRoot.paths);
   const newPaths = record(newRoot.paths);
   let checkedOperations = 0;
@@ -573,10 +559,7 @@ export function compareSpecifications(oldRoot: JsonObject, newRoot: JsonObject):
       const oldOp = resolve(oldRoot, rawOldOp);
       const newOp = resolve(newRoot, newPath[method]);
 
-      if (effectiveSecurity(oldRoot, oldOp) !== effectiveSecurity(newRoot, newOp)) {
-        report.notice('SECURITY_NOT_COMPARED', where,
-          'Security requirements changed; authentication compatibility is not evaluated and must be reviewed manually.');
-      }
+      compareSecurity(security, oldOp, newOp, where, report);
 
       compareParameters(
         before,
@@ -608,6 +591,8 @@ export function compareSpecifications(oldRoot: JsonObject, newRoot: JsonObject):
       }
     }
   }
+
+  reportSchemeChanges(security, report);
 
   const byLocation = (a: Finding, b: Finding) =>
     a.location.localeCompare(b.location) || a.code.localeCompare(b.code);
