@@ -43,6 +43,28 @@ const NOTICE_ONLY_SPEC = spec({ pattern: '^[a-z]{2,}$' });
 const BREAKING_AND_NOTICE_SPEC = spec({ responseProperties: { id: 'integer', name: 'string' }, pattern: '^[A-Z]+$' });
 const INVALID_SPEC = 'swagger: "2.0"\npaths: {}\n';
 
+/** The base document plus an OAuth2 scheme and a document-level requirement. */
+function securedSpec(requirement, tokenUrl = 'https://auth.example.test/token') {
+  return [
+    spec().trimEnd(),
+    'components:',
+    '  securitySchemes:',
+    '    oauth:',
+    '      type: oauth2',
+    '      flows:',
+    '        clientCredentials:',
+    `          tokenUrl: ${tokenUrl}`,
+    '          scopes: { read: Read users, write: Change users }',
+    'security:',
+    `  - ${requirement}`,
+    '',
+  ].join('\n');
+}
+
+const SECURED_SPEC = securedSpec('oauth: [read]');
+const SECURITY_TIGHTENED_SPEC = securedSpec('oauth: [read, write]');
+const SECURITY_REDEFINED_SPEC = securedSpec('oauth: [read]', 'https://login.example.test/token');
+
 /** An in-memory Git tree: `{ sha: { path: contents } }`. */
 function fakeGit(options = {}) {
   const {
@@ -257,6 +279,55 @@ test('review notices alone pass the check but raise a visible warning', async ()
   assert.ok(io.record.warning.some(w => /manual review/.test(w)),
     'a passing check still says a review is needed');
   assert.match(io.record.summary[0], /CONSTRAINT_NOT_COMPARED/);
+});
+
+test('a tightened security requirement fails the check like any breaking change', async () => {
+  const { outcome, io } = await run({
+    git: { commits: { [BASE_SHA]: { [SPEC]: SECURED_SPEC }, [HEAD_SHA]: {} } },
+    files: { files: { [`${ROOT}/${SPEC}`]: SECURITY_TIGHTENED_SPEC } },
+  });
+  assert.equal(outcome.status, 'breaking');
+  assert.equal(outcome.breakingCount, 1);
+  assert.equal(outcome.noticeCount, 0);
+  assert.equal(io.record.failed.length, 1);
+  assert.equal(io.record.outputs.breaking, 'true');
+  assert.equal(io.record.outputs['breaking-count'], '1');
+  assert.match(io.record.summary[0], /`SECURITY_SCOPE_REQUIRED` \| `GET \/users`/);
+});
+
+test('newly mandatory authentication fails the check', async () => {
+  const { outcome, io } = await run({
+    files: { files: { [`${ROOT}/${SPEC}`]: SECURED_SPEC } },
+  });
+  assert.equal(outcome.status, 'breaking');
+  assert.equal(io.record.outputs['breaking-count'], '1');
+  assert.match(io.record.summary[0], /SECURITY_AUTHENTICATION_REQUIRED/);
+});
+
+test('a relaxed security requirement passes the check', async () => {
+  const { outcome, io } = await run({
+    git: { commits: { [BASE_SHA]: { [SPEC]: SECURITY_TIGHTENED_SPEC }, [HEAD_SHA]: {} } },
+    files: { files: { [`${ROOT}/${SPEC}`]: SECURED_SPEC } },
+  });
+  assert.equal(outcome.status, 'compatible');
+  assert.equal(outcome.noticeCount, 0);
+  assert.deepEqual(io.record.failed, []);
+  assert.deepEqual(io.record.warning, []);
+});
+
+test('an inconclusive security change passes the check but asks for a review', async () => {
+  const { outcome, io } = await run({
+    git: { commits: { [BASE_SHA]: { [SPEC]: SECURED_SPEC }, [HEAD_SHA]: {} } },
+    files: { files: { [`${ROOT}/${SPEC}`]: SECURITY_REDEFINED_SPEC } },
+  });
+  assert.equal(outcome.status, 'compatible');
+  assert.equal(outcome.breakingCount, 0);
+  assert.equal(outcome.noticeCount, 1);
+  assert.deepEqual(io.record.failed, []);
+  assert.equal(io.record.outputs.breaking, 'false');
+  assert.equal(io.record.outputs['notice-count'], '1');
+  assert.ok(io.record.warning.some(w => /manual review/.test(w)));
+  assert.match(io.record.summary[0], /`SECURITY_NOT_COMPARED` \| `components\.securitySchemes\.oauth`/);
 });
 
 // --- 6..9: failures must never read as compatible ---------------------------
