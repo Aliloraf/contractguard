@@ -53,10 +53,10 @@ npm run cli -- --base examples/before.yaml --head examples/after.yaml
 
 | | |
 | --- | --- |
-| **Catches** | removed operations, parameters, success responses and media types; newly required parameters, bodies and fields; request enums narrowed; response enums widened; numeric, length and item-count ranges tightened for requests or relaxed for responses; objects closed to extra properties; response fields removed or made optional; type changes, directionally, with `integer` understood as part of `number`; authentication made mandatory, extra security schemes or OAuth2/OpenID Connect scopes required, and accepted authentication alternatives removed |
-| **Understands** | OpenAPI 3.0 and 3.1, YAML and JSON, internal `$ref` (including recursion), nested objects and arrays, `allOf` wherever it can be merged without changing meaning, and `security` as an access rule: document defaults, operation overrides, `security: []`, optional authentication, alternatives (OR) and combined schemes (AND) |
-| **Reports for review instead of guessing** | `anyOf`/`oneOf` changes whose effect depends on overlapping alternatives, `allOf` that cannot be merged safely, `pattern`, `format`, `multipleOf` and other constraints needing instance-level reasoning, and `security` changes that hinge on a renamed, redefined or undefined scheme |
-| **Does not check** | external or multi-file `$ref`, non-`2xx` responses, response headers, `servers`, `webhooks`, `callbacks`, or anything else in [the limitations](#what-the-engine-does-not-support) |
+| **Catches** | removed operations, parameters, success responses and media types; newly required parameters, bodies and fields; request enums narrowed; response enums widened; numeric, length and item-count ranges tightened for requests or relaxed for responses; objects closed to extra properties; response fields removed or made optional; type changes, directionally, with `integer` understood as part of `number`; response headers removed, made optional or changed in type, constraints or serialisation; the same body and header rules on documented error, range and `default` responses; authentication made mandatory, extra security schemes or OAuth2/OpenID Connect scopes required, and accepted authentication alternatives removed |
+| **Understands** | OpenAPI 3.0 and 3.1, YAML and JSON, internal `$ref` (including recursion), nested objects and arrays, `allOf` wherever it can be merged without changing meaning, and response status keys the way OpenAPI resolves them: an explicit code, then its `nXX` range, then `default`, and `security` as an access rule: document defaults, operation overrides, `security: []`, optional authentication, alternatives (OR) and combined schemes (AND) |
+| **Reports for review instead of guessing** | `anyOf`/`oneOf` changes whose effect depends on overlapping alternatives, `allOf` that cannot be merged safely, `pattern`, `format`, `multipleOf` and other constraints needing instance-level reasoning, `security` changes that hinge on a renamed, redefined or undefined scheme, and documented statuses that were added, removed or moved between an explicit code, a range and `default` |
+| **Does not check** | external or multi-file `$ref`, response `links`, media type ranges, `servers`, `webhooks`, `callbacks`, or anything else in [the limitations](#what-the-engine-does-not-support) |
 
 A clean report is not a proof of compatibility. Everything the engine cannot evaluate is
 listed explicitly as a review-required notice rather than passed over in silence.
@@ -75,11 +75,11 @@ Every finding carries a stable rule code:
 | Rule code | Detected change |
 | --- | --- |
 | `OPERATION_REMOVED` | A documented path + method is gone (or its whole path is gone). |
-| `SUCCESS_RESPONSE_REMOVED` | A documented `2xx` status code is gone from an operation. |
+| `SUCCESS_RESPONSE_REMOVED` | A documented `2xx` status code or `2XX` range is gone from an operation, and no remaining success response keeps what it promised. See [Responses](#responses-status-codes-and-headers). |
 | `PARAMETER_REMOVED` | A path-level or operation-level parameter (`in` + `name`) is gone. |
 | `PARAMETER_REQUIRED` | A parameter that was optional (or new) is now required. Path parameters count as required even when `required: true` is omitted. |
 | `REQUEST_BODY_REQUIRED` | An operation's request body became `required: true`. |
-| `MEDIA_TYPE_REMOVED` | A request or `2xx` response media type is no longer offered. |
+| `MEDIA_TYPE_REMOVED` | A request or response media type is no longer offered. Applies to every documented response, including error, range and `default` responses, and to a header described by `content`. |
 | `SCHEMA_TYPE_CHANGED` | A request no longer accepts a type it used to, or a response may now return a type it previously could not (`integer` counts as a `number`). Also covers a request gaining, or a response losing, its type constraint. |
 | `REQUEST_ENUM_NARROWED` | Values were removed from a request-side `enum`, or an `enum` was introduced where the value was previously unconstrained. |
 | `RESPONSE_ENUM_EXPANDED` | A response `enum` gained values, or lost its `enum` constraint entirely — deployed clients may not handle the new values. |
@@ -92,16 +92,20 @@ Every finding carries a stable rule code:
 | `REQUEST_ITEM_COUNT_NARROWED` | A request array's `minItems`/`maxItems` window tightened. |
 | `RESPONSE_ITEM_COUNT_WIDENED` | A response array's `minItems`/`maxItems` guarantee relaxed. |
 | `REQUEST_FIELD_REMOVED` | A property was dropped from a request schema with `additionalProperties: false`. |
-| `RESPONSE_FIELD_REMOVED` | A `2xx` response property was removed. |
+| `RESPONSE_FIELD_REMOVED` | A response property was removed, in a success or an error body. |
 | `RESPONSE_FIELD_OPTIONAL` | A previously guaranteed (`required`) response property is now optional. |
+| `RESPONSE_HEADER_REMOVED` | A documented response header is gone. Header names are matched without regard to case. |
+| `RESPONSE_HEADER_OPTIONAL` | A response header that was `required: true` is now optional. |
+| `RESPONSE_HEADER_SERIALIZATION_CHANGED` | `explode` changed on a header whose value is an object, so the value is written differently on the wire. |
 | `SECURITY_AUTHENTICATION_REQUIRED` | An operation that accepted unauthenticated requests now requires credentials. |
 | `SECURITY_SCHEME_REQUIRED` | A security requirement that used to suffice must now be combined with a further scheme. |
 | `SECURITY_SCOPE_REQUIRED` | An OAuth2 or OpenID Connect requirement now demands scopes it did not demand before. |
 | `SECURITY_ALTERNATIVE_REMOVED` | A previously accepted authentication alternative is gone, and no remaining alternative is satisfied by the same credentials. |
 
 Rules apply at every depth: nested objects, array elements (reported as `path[]`), parameter
-schemas and request/response bodies, with locations such as
-`GET /orders 200 response [application/json].items[].price`.
+schemas, request/response bodies and response header schemas, with locations such as
+`GET /orders 200 response [application/json].items[].price` and
+`GET /orders 429 response header Retry-After`.
 
 Schema handling details:
 
@@ -206,6 +210,67 @@ already covered), **every** `oneOf` change (because "exactly one must match" mea
 alternative can invalidate instances that were valid before, whenever alternatives overlap),
 and a union added or removed on one side only.
 
+## Responses, status codes and headers
+
+Every documented response is compared, not only `2xx`: error statuses, `nXX` ranges and
+`default` are held to the same directional rules as a success body. A response may only
+promise *more* — so a field removed from a `404` body, a widened error `enum` or a dropped
+error media type is reported with the same rule codes, at a location such as
+`GET /orders 404 response [application/json].detail`.
+
+### Response headers
+
+Headers are compared on every response declared under the same key on both sides. Names are
+matched case-insensitively, `$ref`s to `components.headers` are resolved on each side, and a
+header named `Content-Type` is ignored, as OpenAPI requires.
+
+| Change | Result |
+| --- | --- |
+| Header removed (required or optional) | `RESPONSE_HEADER_REMOVED` |
+| `required: true` → optional | `RESPONSE_HEADER_OPTIONAL` |
+| Header added; optional → required | compatible |
+| Schema changed | the ordinary response-direction schema rules: `SCHEMA_TYPE_CHANGED`, `RESPONSE_ENUM_EXPANDED`, `RESPONSE_RANGE_WIDENED`, `RESPONSE_LENGTH_WIDENED`, `RESPONSE_ITEM_COUNT_WIDENED`, and the field rules for object-valued headers |
+| `explode` changed, value is an object | `RESPONSE_HEADER_SERIALIZATION_CHANGED` |
+| `explode` changed, value is a primitive or an array | compatible — `simple` style writes both the same way |
+| `explode` changed, value type not established | `HEADER_NOT_COMPARED` |
+| `style` changed; a field outside the Header Object changed (`allowEmptyValue`, …) | `HEADER_NOT_COMPARED` |
+| Header described by `content` on both sides | compared through its media type schema |
+| Header switched between `schema` and `content` | `HEADER_NOT_COMPARED` |
+| `description`, `example(s)`, `deprecated`, `x-` extensions | ignored |
+
+Header schemas go through the same engine as bodies, so `allOf` merging, `anyOf`/`oneOf`
+notices and `CONSTRAINT_NOT_COMPARED` for `pattern` or `format` apply unchanged.
+
+### Status codes, ranges and `default`
+
+A response key present on both sides is compared directly. A key present on one side only is
+**never judged from the key alone**: an OpenAPI document does not say which statuses an
+operation really returns, so a status that appears or disappears is not proof of a behaviour
+change. Instead the engine looks up the response that describes that status on the other
+side, using OpenAPI's own precedence — an explicit code, then its `nXX` range, then
+`default` — and compares the two definitions:
+
+| Change | Result |
+| --- | --- |
+| Error status removed, and a range or `default` that describes it keeps everything it promised (`400` + `404` folded into an identical `4XX`) | compatible |
+| Error status removed, and the range or `default` that now describes it promises less | `RESPONSE_COVERAGE_CHANGED` notice, naming what differs |
+| Error status, range or `default` removed, with nothing left to describe it | `RESPONSE_STATUS_REMOVED` notice |
+| Status newly declared, previously described by a range or `default` with a compatible definition (`404` split out of `default`) | compatible |
+| Status newly declared, and its definition promises less than the range or `default` that described it before | `RESPONSE_COVERAGE_CHANGED` notice |
+| Status, range or `default` newly documented where nothing described it before | `RESPONSE_STATUS_ADDED` notice |
+| Success status removed, and a `2XX` range now describes it and keeps everything it promised | compatible |
+| Success status removed, with no `2XX` range, or one that promises less | `SUCCESS_RESPONSE_REMOVED` |
+| `2XX` range removed while explicit success codes are declared | compatible; each code is compared against the range |
+| `2XX` range removed with no success response left | `SUCCESS_RESPONSE_REMOVED` |
+
+`default` never stands in for a removed success response, and a range only describes codes
+of its own class. Keys that are not a status code, an uppercase `nXX` range or `default`
+(`2xx`, `20X`, `600`) are compared when present on both sides and otherwise reported as
+added or removed without being interpreted; `x-` extensions are ignored.
+
+Only `SUCCESS_RESPONSE_REMOVED` is a verdict here. Every other change to the *set* of
+documented statuses is a notice, because whether a deployed client is affected depends on
+what the service actually returns.
 ## Security requirements
 
 `security` is compared as an **access rule**, not as an array. For each operation the engine
@@ -271,7 +336,11 @@ check and **do not** change the CLI exit code; they tell you where a human still
 | --- | --- |
 | `UNSUPPORTED_COMPOSITION` | A composed schema could not be analysed: an `allOf` that cannot be merged without changing its meaning, or an `anyOf`/`oneOf` change whose effect depends on whether alternatives overlap. The message names the reason. |
 | `UNSUPPORTED_TUPLE_ITEMS` | `prefixItems` (3.1 tuple validation) is present and is not evaluated. |
-| `SCHEMA_NOT_COMPARED` | One side of a pair declares a schema and the other does not (media type, array `items`, parameter), or a parameter uses `content` serialisation. |
+| `SCHEMA_NOT_COMPARED` | One side of a pair declares a schema and the other does not (media type, array `items`, parameter, response header), or a parameter uses `content` serialisation. |
+| `HEADER_NOT_COMPARED` | A response header changed in a way that is not evaluated: `style`, `explode` on a value whose type is not established, a switch between `schema` and `content`, a field outside the Header Object, or a name declared twice under different capitalisation. |
+| `RESPONSE_STATUS_ADDED` | A status code, range or `default` response is documented where nothing described it before. Whether the operation already returned it, and whether clients handle it, cannot be established. |
+| `RESPONSE_STATUS_REMOVED` | A non-success status code, range or `default` response is gone and nothing else describes it. It may no longer be returned, or be returned undocumented. |
+| `RESPONSE_COVERAGE_CHANGED` | A status is still documented, but by a different entry (an explicit code, its range, or `default`), and the new definition could not be shown to keep what the old one promised. The message lists the rule codes that differ. |
 | `SECURITY_NOT_COMPARED` | A `security` change could not be decided: it depends on a scheme that is undefined, unsupported, renamed or redefined, on a role list for a scheme without scopes, or on a malformed `security` value. Also raised once per scheme, at `components.securitySchemes.<name>`, when a definition changed underneath operations that still require it. See [Security requirements](#security-requirements). |
 | `CONSTRAINT_NOT_COMPARED` | A validation keyword that cannot be evaluated reliably changed: `pattern`, `format`, `multipleOf`, `uniqueItems`, `contains`/`minContains`/`maxContains`, `minProperties`/`maxProperties`, `patternProperties`, `propertyNames`, `dependentRequired`/`dependentSchemas`, `const`, `readOnly`/`writeOnly`, `unevaluatedProperties`/`unevaluatedItems`, or an `additionalProperties` subschema. Unchanged keywords stay quiet, since they cannot affect compatibility. |
 
@@ -297,7 +366,17 @@ check and **do not** change the CLI exit code; they tell you where a human still
 - **Authorization beyond the declared requirements** — what a scope or an identity is
   entitled to, scope hierarchies (a broader scope implying a narrower one) and
   vendor-specific security extensions are outside the model.
-- **Non-`2xx` responses** — error responses and response headers are not compared.
+- **Which statuses an operation really returns** — added, removed and re-keyed statuses are
+  compared by definition and otherwise reported as notices; apart from
+  `SUCCESS_RESPONSE_REMOVED` they never fail the check.
+- **Differences found while matching a status to a range or `default`** are summarised as
+  rule codes in one `RESPONSE_COVERAGE_CHANGED` notice rather than listed individually.
+- **Media types are matched literally** — media type ranges (`application/*`, `*/*`),
+  parameters (`; charset=utf-8`) and letter case are not interpreted, for bodies or headers.
+- **Response `links`** and the response `description` are not compared.
+- **Header semantics beyond the schema** — what a header means (`Cache-Control` directives,
+  `Link` relations, date formats) is not modelled, and header `style` values other than
+  `simple` are reported rather than evaluated.
 - **Constraints that need instance-level or language-level reasoning** are not evaluated:
   `pattern` (no regular expression inclusion analysis is attempted), `format`, `multipleOf`,
   `uniqueItems`, `contains`, `minProperties`/`maxProperties`, `patternProperties`,
@@ -305,7 +384,7 @@ check and **do not** change the CLI exit code; they tell you where a human still
   of them raises `CONSTRAINT_NOT_COMPARED` instead of being treated as compatible.
 - **Annotation keywords** (`default`, `title`, `description`, `example`, `deprecated`) are
   ignored entirely, including for notices.
-- **`servers`, `webhooks`, `callbacks`, `links`, `style`/`explode`** and OpenAPI document
+- **`servers`, `webhooks`, `callbacks`, parameter `style`/`explode`** and OpenAPI document
   validation in general — ContractGuard only checks that `openapi` is `3.0.x`/`3.1.x` and
   that `paths` is an object.
 - **Added paths/operations** are never reported (they are additive by definition).
@@ -587,7 +666,8 @@ end-to-end behaviour on GitHub is worth confirming once per release:
 1. **v0.1** — comparison engine, CLI, bundled GitHub Action, unit tests *(done)*.
 2. **v0.2** — directional type/enum rules, numeric/string/array/object constraints, safe
    `allOf` merging, provable `anyOf`/`oneOf` cases, directional `security` requirement
-   analysis, explicit review-required notices *(current)*; still to come: `anyOf`/`oneOf` subsumption analysis, broader third-party
+   analysis, response headers, error responses and
+   status ranges, explicit review-required notices *(current)*; still to come: `anyOf`/`oneOf` subsumption analysis, broader third-party
    fixtures.
 3. **v0.3** — inline PR annotations, ignore/config rules, JSON diff export, multi-file `$ref`,
    multiple specification paths per run.

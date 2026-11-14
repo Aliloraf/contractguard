@@ -25,6 +25,7 @@ import {
   valueKey,
 } from './schema';
 import { BranchDelta, compareBranchLists, flattenAllOf } from './composition';
+import { ResponseRules, compareResponses } from './responses';
 import { compareSecurity, reportSchemeChanges, securityContext } from './security';
 
 const METHODS = ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace'] as const;
@@ -472,6 +473,14 @@ function compareContent(
   }
 }
 
+/** Responses and their headers are judged by the rules above, as responses. */
+const RESPONSE_RULES: ResponseRules = {
+  schema: (before, after, oldSchema, newSchema, location, report) =>
+    compareSchema(before, after, oldSchema, newSchema, location, 'response', report, new WeakMap(), 0),
+  content: (before, after, oldContent, newContent, location, report) =>
+    compareContent(before, after, oldContent, newContent, location, 'response', report),
+};
+
 /** Path parameters are always required, whether or not `required: true` is written out. */
 function isRequiredParameter(parameter: JsonObject): boolean {
   return parameter.required === true || parameter.in === 'path';
@@ -577,18 +586,7 @@ export function compareSpecifications(oldRoot: JsonObject, newRoot: JsonObject):
       }
       compareContent(before, after, oldBody.content, newBody.content, `${where} request`, 'request', report);
 
-      const oldResponses = record(oldOp.responses);
-      const newResponses = record(newOp.responses);
-      for (const [status, oldResponse] of Object.entries(oldResponses)) {
-        if (!/^2\d\d$/.test(status)) continue;
-        if (!(status in newResponses)) {
-          report.breaking('SUCCESS_RESPONSE_REMOVED', `${where} ${status}`, 'Previously documented success status removed.');
-          continue;
-        }
-        const previous = resolve(oldRoot, oldResponse);
-        const next = resolve(newRoot, newResponses[status]);
-        compareContent(before, after, previous.content, next.content, `${where} ${status} response`, 'response', report);
-      }
+      compareResponses(before, after, oldOp, newOp, where, report, RESPONSE_RULES);
     }
   }
 

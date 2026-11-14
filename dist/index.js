@@ -32344,6 +32344,7 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.compareSpecifications = compareSpecifications;
 const schema_1 = __nccwpck_require__(5060);
 const composition_1 = __nccwpck_require__(8377);
+const responses_1 = __nccwpck_require__(6539);
 const security_1 = __nccwpck_require__(3725);
 const METHODS = ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace'];
 /** Alternatives, handled by proof rather than by merging. */
@@ -32675,6 +32676,11 @@ function compareContent(before, after, oldContent, newContent, location, directi
         }
     }
 }
+/** Responses and their headers are judged by the rules above, as responses. */
+const RESPONSE_RULES = {
+    schema: (before, after, oldSchema, newSchema, location, report) => compareSchema(before, after, oldSchema, newSchema, location, 'response', report, new WeakMap(), 0),
+    content: (before, after, oldContent, newContent, location, report) => compareContent(before, after, oldContent, newContent, location, 'response', report),
+};
 /** Path parameters are always required, whether or not `required: true` is written out. */
 function isRequiredParameter(parameter) {
     return parameter.required === true || parameter.in === 'path';
@@ -32759,19 +32765,7 @@ function compareSpecifications(oldRoot, newRoot) {
                 report.breaking('REQUEST_BODY_REQUIRED', where, 'Request body is now required.');
             }
             compareContent(before, after, oldBody.content, newBody.content, `${where} request`, 'request', report);
-            const oldResponses = (0, schema_1.record)(oldOp.responses);
-            const newResponses = (0, schema_1.record)(newOp.responses);
-            for (const [status, oldResponse] of Object.entries(oldResponses)) {
-                if (!/^2\d\d$/.test(status))
-                    continue;
-                if (!(status in newResponses)) {
-                    report.breaking('SUCCESS_RESPONSE_REMOVED', `${where} ${status}`, 'Previously documented success status removed.');
-                    continue;
-                }
-                const previous = (0, schema_1.resolve)(oldRoot, oldResponse);
-                const next = (0, schema_1.resolve)(newRoot, newResponses[status]);
-                compareContent(before, after, previous.content, next.content, `${where} ${status} response`, 'response', report);
-            }
+            (0, responses_1.compareResponses)(before, after, oldOp, newOp, where, report, RESPONSE_RULES);
         }
     }
     (0, security_1.reportSchemeChanges)(security, report);
@@ -33506,6 +33500,313 @@ function renderMarkdown(result) {
     }
     lines.push('', '> ContractGuard uses a deliberately limited rule set; a passing report is not a guarantee of full backward compatibility.', '');
     return lines.join('\n');
+}
+
+
+/***/ }),
+
+/***/ 6539:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.compareResponses = compareResponses;
+const schema_1 = __nccwpck_require__(5060);
+const composition_1 = __nccwpck_require__(8377);
+function has(map, key) {
+    return Object.hasOwn(map, key);
+}
+function classify(key) {
+    if (key === 'default')
+        return { kind: 'default' };
+    if (/^[1-5]\d\d$/.test(key))
+        return { kind: 'code', family: key[0] };
+    if (/^[1-5]XX$/.test(key))
+        return { kind: 'range', family: key[0] };
+    return { kind: 'other' };
+}
+/** The Responses Object without its specification extensions. */
+function responseMap(value) {
+    const map = {};
+    for (const [key, response] of Object.entries((0, schema_1.record)(value))) {
+        if (!key.startsWith('x-'))
+            map[key] = response;
+    }
+    return map;
+}
+/**
+ * The entry that describes a status once its own key is not declared. OpenAPI
+ * gives an explicit code precedence over its range, and `default` describes
+ * whatever is not declared otherwise.
+ */
+function fallbackKey(responses, status) {
+    if (status.kind === 'code' && has(responses, `${status.family}XX`))
+        return `${status.family}XX`;
+    if ((status.kind === 'code' || status.kind === 'range') && has(responses, 'default'))
+        return 'default';
+    return null;
+}
+function explicitCodes(responses, family) {
+    return Object.keys(responses)
+        .filter(key => {
+        const status = classify(key);
+        return status.kind === 'code' && status.family === family;
+    })
+        .sort();
+}
+const FAMILY_NAMES = {
+    1: 'informational', 2: 'success', 3: 'redirection', 4: 'client error', 5: 'server error',
+};
+// --- Headers ---------------------------------------------------------------------
+/** Header Object fields that are evaluated, or that carry no contract meaning. */
+const HEADER_FIELDS = new Set([
+    'description', 'deprecated', 'example', 'examples',
+    'required', 'schema', 'content', 'style', 'explode',
+]);
+function headerSet(root, value) {
+    const headers = new Map();
+    const ambiguous = new Map();
+    for (const [name, raw] of Object.entries((0, schema_1.record)(value))) {
+        const key = name.toLowerCase();
+        // OpenAPI: a response header named Content-Type is ignored; the media types
+        // of `content` describe it.
+        if (key === 'content-type')
+            continue;
+        const existing = headers.get(key);
+        if (existing || ambiguous.has(key)) {
+            ambiguous.set(key, existing?.name ?? ambiguous.get(key) ?? name);
+            headers.delete(key);
+            continue;
+        }
+        headers.set(key, { name, header: (0, schema_1.resolve)(root, raw) });
+    }
+    return { headers, ambiguous };
+}
+const UNDECIDED_KEYWORDS = ['anyOf', 'oneOf', 'not', 'if', 'then', 'else', 'enum', 'const'];
+function objectValues(doc, rawSchema) {
+    if (rawSchema === undefined)
+        return 'unknown';
+    const flat = (0, composition_1.flattenAllOf)(doc, (0, schema_1.resolve)(doc.root, rawSchema));
+    if (!flat.exact)
+        return 'unknown';
+    const types = (0, schema_1.effectiveTypes)(flat.schema);
+    if (types.size === 0)
+        return 'unknown';
+    if (!types.has('object'))
+        return 'impossible';
+    return UNDECIDED_KEYWORDS.some(keyword => keyword in flat.schema) ? 'unknown' : 'possible';
+}
+function describeValue(value) {
+    return value === undefined ? 'absent' : (0, schema_1.valueKey)(value);
+}
+function compareSerialization({ before, after }, previous, next, location, report) {
+    // `simple` is the only style OpenAPI defines for headers, and the default.
+    const oldStyle = previous.style ?? 'simple';
+    const newStyle = next.style ?? 'simple';
+    if ((0, schema_1.valueKey)(oldStyle) !== (0, schema_1.valueKey)(newStyle)) {
+        report.notice('HEADER_NOT_COMPARED', location, `Header \`style\` changed (${describeValue(previous.style)} → ${describeValue(next.style)}); only \`simple\` is defined for headers, so the effect on the serialised value was not evaluated.`);
+    }
+    for (const field of Object.keys({ ...previous, ...next }).sort()) {
+        if (HEADER_FIELDS.has(field) || field.startsWith('x-') || field === '$ref')
+            continue;
+        if ((0, schema_1.valueKey)(previous[field]) === (0, schema_1.valueKey)(next[field]))
+            continue;
+        report.notice('HEADER_NOT_COMPARED', location, `Header field \`${field}\` changed (${describeValue(previous[field])} → ${describeValue(next[field])}); it is not evaluated for response headers.`);
+    }
+    const oldExplode = previous.explode ?? false;
+    const newExplode = next.explode ?? false;
+    if (oldExplode === newExplode)
+        return;
+    const change = `${describeValue(previous.explode)} → ${describeValue(next.explode)}`;
+    if (typeof oldExplode !== 'boolean' || typeof newExplode !== 'boolean') {
+        report.notice('HEADER_NOT_COMPARED', location, `Header \`explode\` changed (${change}) and is not a boolean; the serialised value was not evaluated.`);
+        return;
+    }
+    // A schema that does not take part in serialisation (a `content` header, or
+    // none at all) is left to the schema and content rules.
+    if (previous.schema === undefined || next.schema === undefined)
+        return;
+    const now = objectValues(after, next.schema);
+    if (now === 'impossible')
+        return;
+    const was = objectValues(before, previous.schema);
+    if (now === 'possible' && was === 'impossible')
+        return;
+    if (now === 'possible' && was === 'possible') {
+        report.breaking('RESPONSE_HEADER_SERIALIZATION_CHANGED', location, `Header \`explode\` changed (${change}); an object value is now written ${newExplode ? 'as `key=value` pairs instead of alternating keys and values' : 'as alternating keys and values instead of `key=value` pairs'}, which deployed clients parse differently.`);
+        return;
+    }
+    report.notice('HEADER_NOT_COMPARED', location, `Header \`explode\` changed (${change}); this alters the serialised value only for objects, and whether this header can carry one could not be established from its schema.`);
+}
+function compareHeader(comparison, previous, next, location, report) {
+    const { before, after, rules } = comparison;
+    if (previous.required === true && next.required !== true) {
+        report.breaking('RESPONSE_HEADER_OPTIONAL', location, 'Previously guaranteed response header is now optional.');
+    }
+    const oldForm = previous.content !== undefined ? 'content' : previous.schema !== undefined ? 'schema' : null;
+    const newForm = next.content !== undefined ? 'content' : next.schema !== undefined ? 'schema' : null;
+    if (oldForm !== newForm) {
+        if (oldForm === 'content' || newForm === 'content') {
+            report.notice('HEADER_NOT_COMPARED', location, `Header value is described by ${oldForm ? `\`${oldForm}\`` : 'nothing'} on the base side and by ${newForm ? `\`${newForm}\`` : 'nothing'} on the head side; value compatibility was not evaluated.`);
+        }
+        else {
+            report.notice('SCHEMA_NOT_COMPARED', location, `A schema is declared on only the ${oldForm ? 'base' : 'head'} side of this header; value compatibility was not evaluated.`);
+        }
+    }
+    else if (oldForm === 'schema') {
+        rules.schema(before, after, previous.schema, next.schema, location, report);
+    }
+    else if (oldForm === 'content') {
+        rules.content(before, after, previous.content, next.content, location, report);
+    }
+    compareSerialization(comparison, previous, next, location, report);
+}
+function compareHeaders(comparison, oldHeaders, newHeaders, location, report) {
+    const previous = headerSet(comparison.before.root, oldHeaders);
+    const next = headerSet(comparison.after.root, newHeaders);
+    const ambiguous = new Map([...next.ambiguous, ...previous.ambiguous]);
+    for (const [key, name] of ambiguous) {
+        report.notice('HEADER_NOT_COMPARED', `${location} header ${name}`, 'This header is declared more than once under names that differ only in case; header names are case-insensitive, so which declaration applies is ambiguous and it was not compared.');
+        previous.headers.delete(key);
+        next.headers.delete(key);
+    }
+    for (const [key, { name, header }] of previous.headers) {
+        const where = `${location} header ${name}`;
+        const counterpart = next.headers.get(key);
+        if (!counterpart) {
+            report.breaking('RESPONSE_HEADER_REMOVED', where, header.required === true
+                ? 'Previously guaranteed response header removed.'
+                : 'Response header removed; clients that read it no longer receive it.');
+            continue;
+        }
+        compareHeader(comparison, header, counterpart.header, where, report);
+    }
+}
+// --- Responses -------------------------------------------------------------------
+function compareResponse(comparison, oldResponse, newResponse, location, report) {
+    const { before, after, rules } = comparison;
+    const previous = (0, schema_1.resolve)(before.root, oldResponse);
+    const next = (0, schema_1.resolve)(after.root, newResponse);
+    rules.content(before, after, previous.content, next.content, location, report);
+    compareHeaders(comparison, previous.headers, next.headers, location, report);
+}
+/**
+ * Compares two responses without reporting, and returns the rule codes the
+ * comparison would have raised. An empty list is a proof that everything the
+ * old response promised is still promised by the new one.
+ */
+function differences(comparison, oldResponse, newResponse, location) {
+    const codes = new Set();
+    const collect = (code) => { codes.add(code); };
+    compareResponse(comparison, oldResponse, newResponse, location, { breaking: collect, notice: collect });
+    return [...codes].sort();
+}
+function label(key, status) {
+    if (status.kind === 'default')
+        return '`default` response';
+    if (status.kind === 'range')
+        return `\`${key}\` response range`;
+    return `\`${key}\` response`;
+}
+function reportRemoved(comparison, key, oldResponses, newResponses, where, report) {
+    const status = classify(key);
+    const location = `${where} ${key}`;
+    if (status.kind === 'other') {
+        report.notice('RESPONSE_STATUS_REMOVED', location, `Response \`${key}\` was removed; the key is not a status code, an \`nXX\` range or \`default\`, so what it described could not be established.`);
+        return;
+    }
+    if (status.kind === 'default') {
+        report.notice('RESPONSE_STATUS_REMOVED', location, 'The `default` response was removed; statuses without a response of their own are no longer documented. Whether they are no longer returned, or returned without documentation, cannot be established.');
+        return;
+    }
+    const fallback = fallbackKey(newResponses, status);
+    const remaining = status.kind === 'range' ? explicitCodes(newResponses, status.family) : [];
+    if (status.family === '2') {
+        if (status.kind === 'range') {
+            // Narrowed to explicit codes: each is compared against the range where it
+            // is reported as newly declared.
+            if (remaining.length === 0) {
+                report.breaking('SUCCESS_RESPONSE_REMOVED', location, 'Previously documented success range removed.');
+            }
+            return;
+        }
+        if (fallback !== null && fallback !== 'default') {
+            const found = differences(comparison, oldResponses[key], newResponses[fallback], `${location} response`);
+            if (found.length > 0) {
+                report.breaking('SUCCESS_RESPONSE_REMOVED', location, `Previously documented success status removed; the \`${fallback}\` range that now describes it does not keep what it promised (${found.join(', ')}).`);
+            }
+            return;
+        }
+        report.breaking('SUCCESS_RESPONSE_REMOVED', location, 'Previously documented success status removed.');
+        return;
+    }
+    if (fallback !== null) {
+        const found = differences(comparison, oldResponses[key], newResponses[fallback], `${location} response`);
+        if (found.length > 0) {
+            report.notice('RESPONSE_COVERAGE_CHANGED', location, `The ${label(key, status)} was removed, so \`${fallback}\` now describes ${status.kind === 'range' ? 'these statuses' : 'this status'}; it could not be shown to keep what the removed response promised (${found.join(', ')}). Review the two definitions manually.`);
+        }
+        return;
+    }
+    const kept = remaining.length > 0 ? ` Only ${remaining.join(', ')} remain documented in this range.` : '';
+    report.notice('RESPONSE_STATUS_REMOVED', location, `The ${label(key, status)} was removed and no range or \`default\` response covers it.${kept} Whether ${status.kind === 'range' ? 'these statuses are' : 'this status is'} no longer returned, or returned without documentation, cannot be established.`);
+}
+function reportAdded(comparison, key, oldResponses, newResponses, where, report) {
+    const status = classify(key);
+    const location = `${where} ${key}`;
+    if (status.kind === 'other') {
+        report.notice('RESPONSE_STATUS_ADDED', location, `Response \`${key}\` was added; the key is not a status code, an \`nXX\` range or \`default\`, so what it describes could not be established.`);
+        return;
+    }
+    if (status.kind === 'default') {
+        report.notice('RESPONSE_STATUS_ADDED', location, 'A `default` response was added; statuses without a response of their own are now documented. Whether the operation already returned them, and whether deployed clients handle them, cannot be established.');
+        return;
+    }
+    const fallback = fallbackKey(oldResponses, status);
+    if (fallback !== null) {
+        const found = differences(comparison, oldResponses[fallback], newResponses[key], `${location} response`);
+        if (found.length > 0) {
+            report.notice('RESPONSE_COVERAGE_CHANGED', location, `The ${label(key, status)} is newly declared; ${status.kind === 'range' ? 'these statuses were' : 'this status was'} described by \`${fallback}\` before, and the new definition could not be shown to keep what that response promised (${found.join(', ')}). Review the two definitions manually.`);
+        }
+        return;
+    }
+    const subject = status.kind === 'range' ? 'statuses' : 'status';
+    report.notice('RESPONSE_STATUS_ADDED', location, `Newly documented ${FAMILY_NAMES[status.family]} ${subject}. Whether the operation already returned ${status.kind === 'range' ? 'them' : 'it'}, and whether deployed clients handle ${status.kind === 'range' ? 'them' : 'it'}, cannot be established.`);
+}
+/**
+ * Compares the responses of one operation.
+ *
+ * A response declared under the same key on both sides is compared directly:
+ * its media types and schemas through the schema engine, and its headers. That
+ * holds for every key, so documented error formats are held to the same rules
+ * as success bodies.
+ *
+ * A key present on one side only is never judged from the key alone. The entry
+ * that describes the status on the other side is looked up the way OpenAPI
+ * defines it (explicit code, then `nXX` range, then `default`) and the two are
+ * compared. If nothing the old response promised is lost the change is
+ * compatible; otherwise it is reported for review, because the documents cannot
+ * say whether the operation really stopped or started returning that status.
+ * The one verdict is a success response that is gone with no success range to
+ * describe it in its place.
+ */
+function compareResponses(before, after, oldOperation, newOperation, where, report, rules) {
+    const comparison = { before, after, rules };
+    const oldResponses = responseMap(oldOperation.responses);
+    const newResponses = responseMap(newOperation.responses);
+    for (const key of Object.keys(oldResponses)) {
+        if (has(newResponses, key)) {
+            compareResponse(comparison, oldResponses[key], newResponses[key], `${where} ${key} response`, report);
+        }
+        else {
+            reportRemoved(comparison, key, oldResponses, newResponses, where, report);
+        }
+    }
+    for (const key of Object.keys(newResponses)) {
+        if (!has(oldResponses, key)) {
+            reportAdded(comparison, key, oldResponses, newResponses, where, report);
+        }
+    }
 }
 
 
