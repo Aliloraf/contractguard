@@ -48,6 +48,29 @@ New review notices:
   value of unestablished type, a switch between `schema` and `content`, a field outside the
   Header Object, or a name declared twice under different capitalisation
 
+**Directional security requirement analysis.** `security` is now compared as an access rule
+instead of being flagged whenever it changed. The engine resolves each operation's effective
+requirements — the document default, an operation override, an explicit `security: []` — and
+checks that every previously accepted requirement is still satisfied by at least one
+alternative, reading the list as alternatives (OR), the schemes in one entry as a
+combination (AND), `{}` as optional authentication, and OAuth2 and OpenID Connect scope lists
+as required scopes.
+
+New breaking rule codes:
+
+- `SECURITY_AUTHENTICATION_REQUIRED` — an operation that accepted unauthenticated requests
+  now requires credentials
+- `SECURITY_SCHEME_REQUIRED` — a requirement that used to suffice must now be combined with a
+  further scheme
+- `SECURITY_SCOPE_REQUIRED` — an OAuth2 or OpenID Connect requirement demands additional
+  scopes
+- `SECURITY_ALTERNATIVE_REMOVED` — an accepted authentication alternative is gone and no
+  remaining alternative is satisfied by the same credentials
+
+Relaxations (security removed, an alternative added, a scope or combined scheme dropped) and
+equivalent spellings (reordering, repetition, `[]` versus `[{}]`, a requirement moved between
+the document and its operations) are recognised as compatible and reported as nothing.
+
 ### Changed
 
 - `SUCCESS_RESPONSE_REMOVED` is no longer raised when a removed `2xx` code is described by a
@@ -61,6 +84,17 @@ New review notices:
 - **Upgrade note:** changes to error responses and response headers that used to go
   unreported can now fail the check, and newly documented or removed statuses now raise
   notices. Exit codes and Action outputs are unchanged in meaning.
+- `SECURITY_NOT_COMPARED` is no longer raised for every `security` change. It is kept for
+  changes that cannot be decided: a scheme that is undefined, of an unsupported type,
+  renamed, or redefined; a changed role list on a scheme without scopes; a malformed
+  `security` value. Its message now names the reason.
+- A security scheme whose definition changed while operations still require it raises one
+  `SECURITY_NOT_COMPARED` notice at `components.securitySchemes.<name>`. Previously such a
+  change was not reported at all when the requirements themselves were untouched.
+- A `security` value that is not a list is reported rather than skipped in favour of the
+  document default.
+- **Upgrade note:** security changes that used to produce only a notice can now fail the
+  check. Exit codes and Action outputs are unchanged in meaning.
 
 ### Known limitations
 
