@@ -32307,6 +32307,8 @@ async function main() {
                 specPath: core.getInput('spec-path', { required: true }),
                 comment,
                 githubToken: token,
+                jsonReportPath: core.getInput('json-report-path'),
+                sarifReportPath: core.getInput('sarif-report-path'),
             },
             context,
             git: (0, git_1.createGitAccess)(workspace),
@@ -33359,7 +33361,9 @@ exports.runContractGuard = runContractGuard;
 const comparator_1 = __nccwpck_require__(2747);
 const git_1 = __nccwpck_require__(1243);
 const load_1 = __nccwpck_require__(259);
+const references_1 = __nccwpck_require__(653);
 const report_1 = __nccwpck_require__(665);
+const report_format_1 = __nccwpck_require__(3577);
 /** A commit-ish accepted from the event payload, before it reaches Git. */
 const SHA_PATTERN = /^[0-9a-f]{7,64}$/;
 /**
@@ -33407,6 +33411,34 @@ function locateSpecification(input, root, files) {
     return { absolute, repositoryPath };
 }
 /**
+ * Validates where a report file may be written. The path comes from workflow
+ * input, so it must stay inside the checkout and may not name the
+ * specification, anything under `.git`, or the other report.
+ */
+function locateReport(inputName, value, format, root, files, specPath) {
+    const requested = (value ?? '').trim();
+    if (requested === '')
+        return null;
+    if (requested.includes('\0'))
+        fail(`${inputName} must not contain NUL characters.`);
+    if (files.isAbsolute(requested) || /^[A-Za-z]:/.test(requested) || requested.startsWith('\\')) {
+        fail(`${inputName} must be relative to the repository, but "${value}" is an absolute path.`);
+    }
+    const repositoryPath = files.relativeTo(root, files.resolve(requested));
+    if (repositoryPath === null || repositoryPath === '') {
+        fail(`${inputName} must point to a file inside the repository, but "${value}" resolves outside it.`);
+    }
+    if (repositoryPath.split('/').includes('.git')) {
+        fail(`${inputName} must not point inside the .git directory.`);
+    }
+    if (requested.endsWith('/') || requested.endsWith('\\'))
+        fail(`${inputName} must name a file, not a directory.`);
+    if (repositoryPath === specPath) {
+        fail(`${inputName} must not be the specification itself ("${specPath}"); it would overwrite it.`);
+    }
+    return { format, input: requested, repositoryPath };
+}
+/**
  * Picks the commit the pull request is measured against: the common ancestor of
  * the base branch and whatever is checked out.
  *
@@ -33450,11 +33482,11 @@ function resolveBaseline(pr, git, io) {
         : 'a merge of the pull request into the base branch';
     if (mergeBase === baseSha) {
         io.info(`Comparing ${headNote} (${short(head)}) against the base commit ${short(baseSha)}.`);
-        return { sha: mergeBase, description: `base commit ${short(baseSha)}` };
+        return { sha: mergeBase, description: `base commit ${short(baseSha)}`, head };
     }
     io.info(`Comparing ${headNote} (${short(head)}) against the merge base ${short(mergeBase)}; `
         + `the base branch is now at ${short(baseSha)}.`);
-    return { sha: mergeBase, description: `merge base ${short(mergeBase)}` };
+    return { sha: mergeBase, description: `merge base ${short(mergeBase)}`, head };
 }
 function parseSpecification(text, origin, path, source) {
     try {
@@ -33551,6 +33583,16 @@ async function execute(env) {
         fail(`The specification "${spec.repositoryPath}" is missing from the checkout. `
             + 'ContractGuard will not report a missing specification as compatible.');
     }
+    const reports = [];
+    const json = locateReport('json-report-path', inputs.jsonReportPath, 'json', root, files, spec.repositoryPath);
+    const sarif = locateReport('sarif-report-path', inputs.sarifReportPath, 'sarif', root, files, spec.repositoryPath);
+    if (json !== null)
+        reports.push(json);
+    if (sarif !== null)
+        reports.push(sarif);
+    if (json !== null && sarif !== null && json.repositoryPath === sarif.repositoryPath) {
+        fail('json-report-path and sarif-report-path must be different files.');
+    }
     const baseline = resolveBaseline(pr, git, io);
     if (!git.fileExistsAt(baseline.sha, spec.repositoryPath)) {
         fail(`"${spec.repositoryPath}" does not exist at the ${baseline.description}, so there is no baseline to `
@@ -33600,6 +33642,26 @@ async function execute(env) {
         io.warning(`${noticeCount} place${noticeCount === 1 ? '' : 's'} could not be evaluated and need a manual review. `
             + 'See the job summary; a clean result is not a guarantee of compatibility there.');
     }
+    if (reports.length > 0) {
+        // File-level physical locations are only truthful when the head specification
+        // is one file; with referenced files a finding may live in any of them.
+        const context = {
+            baseline: { path: spec.repositoryPath, revision: baseline.sha },
+            head: { path: spec.repositoryPath, revision: baseline.head },
+            physicalLocationUri: Object.prototype.hasOwnProperty.call(headSpec, references_1.EXTERNAL_FILES_KEY) ? null : spec.repositoryPath,
+        };
+        for (const destination of reports) {
+            try {
+                files.writeFile(root, destination.repositoryPath, (0, report_format_1.renderReport)(destination.format, result, context));
+            }
+            catch (error) {
+                fail(`Could not write the ${destination.format.toUpperCase()} report to "${destination.repositoryPath}": ${describe(error)}`);
+            }
+            // Echoed as the caller wrote it, so it is valid in a later step of the same job.
+            io.setOutput(`${destination.format}-report-path`, destination.input);
+            io.info(`Wrote the ${destination.format.toUpperCase()} report to ${destination.input}.`);
+        }
+    }
     const comment = await syncComment(env, report);
     if (breakingCount > 0) {
         io.setFailed(`ContractGuard detected ${breakingCount} potentially breaking API change${breakingCount === 1 ? '' : 's'}.`);
@@ -33632,6 +33694,78 @@ async function runContractGuard(env) {
             comment: 'disabled',
         };
     }
+}
+
+
+/***/ }),
+
+/***/ 3604:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.SEVERITY = exports.JSON_REPORT_SCHEMA_VERSION = void 0;
+exports.describeRule = describeRule;
+exports.buildJsonReport = buildJsonReport;
+exports.renderJson = renderJson;
+const report_model_1 = __nccwpck_require__(7517);
+const rules_1 = __nccwpck_require__(9244);
+const version_1 = __nccwpck_require__(311);
+/** Bumped when a field is removed or changes meaning; adding a field does not bump it. */
+exports.JSON_REPORT_SCHEMA_VERSION = '1.0';
+exports.SEVERITY = { breaking: 'error', notice: 'warning' };
+function side(value) {
+    return value === null ? null : { path: value.path, revision: value.revision };
+}
+function findings(list, kind) {
+    return (0, report_model_1.orderFindings)(list).map(finding => ({
+        code: finding.code,
+        severity: exports.SEVERITY[kind],
+        location: finding.location,
+        message: finding.message,
+    }));
+}
+/** Describes a code, including one this catalogue does not know yet. */
+function describeRule(code, kind) {
+    const known = rules_1.RULES[code];
+    return {
+        code,
+        kind,
+        severity: exports.SEVERITY[kind],
+        title: known ? known.title : code,
+        description: known ? known.description : `Reported by the ${version_1.TOOL_NAME} rule ${code}.`,
+    };
+}
+/** The report as a plain object, with a fixed key order. */
+function buildJsonReport(result, context) {
+    const used = new Map();
+    for (const finding of result.notices)
+        used.set(finding.code, 'notice');
+    // A breaking finding wins if a code were ever reported as both.
+    for (const finding of result.breaking)
+        used.set(finding.code, 'breaking');
+    const rules = [...used.entries()]
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([code, kind]) => describeRule(code, kind));
+    return {
+        schemaVersion: exports.JSON_REPORT_SCHEMA_VERSION,
+        tool: { name: version_1.TOOL_NAME, version: version_1.TOOL_VERSION, informationUri: version_1.TOOL_URI },
+        comparison: { baseline: side(context.baseline), head: side(context.head) },
+        summary: {
+            status: result.breaking.length > 0 ? 'breaking' : 'compatible',
+            breaking: result.breaking.length,
+            notices: result.notices.length,
+            checkedOperations: result.checkedOperations,
+        },
+        breaking: findings(result.breaking, 'breaking'),
+        notices: findings(result.notices, 'notice'),
+        rules,
+    };
+}
+/** Two-space indented JSON with a trailing newline; identical input gives identical bytes. */
+function renderJson(result, context) {
+    return `${JSON.stringify(buildJsonReport(result, context), null, 2)}\n`;
 }
 
 
@@ -34107,6 +34241,56 @@ function foldReferences(root, rootPath, source, limits = exports.DEFAULT_REFEREN
 
 /***/ }),
 
+/***/ 3577:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.REPORT_FORMATS = void 0;
+exports.isReportFormat = isReportFormat;
+exports.renderReport = renderReport;
+const json_report_1 = __nccwpck_require__(3604);
+const report_1 = __nccwpck_require__(665);
+const sarif_1 = __nccwpck_require__(866);
+const report_model_1 = __nccwpck_require__(7517);
+exports.REPORT_FORMATS = ['markdown', 'json', 'sarif'];
+function isReportFormat(value) {
+    return exports.REPORT_FORMATS.includes(value);
+}
+/** Renders a result in the requested format. Markdown ignores the context. */
+function renderReport(format, result, context = report_model_1.EMPTY_CONTEXT) {
+    switch (format) {
+        case 'markdown': return (0, report_1.renderMarkdown)(result);
+        case 'json': return (0, json_report_1.renderJson)(result, context);
+        case 'sarif': return (0, sarif_1.renderSarif)(result, context);
+    }
+}
+
+
+/***/ }),
+
+/***/ 7517:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.EMPTY_CONTEXT = void 0;
+exports.orderFindings = orderFindings;
+exports.EMPTY_CONTEXT = { baseline: null, head: null, physicalLocationUri: null };
+/** Code-point order, so the result never depends on the machine's locale. */
+function ordinal(a, b) {
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+/** Findings in a fixed order: location, then rule code, then message. */
+function orderFindings(findings) {
+    return [...findings].sort((a, b) => ordinal(a.location, b.location) || ordinal(a.code, b.code) || ordinal(a.message, b.message));
+}
+
+
+/***/ }),
+
 /***/ 665:
 /***/ ((__unused_webpack_module, exports) => {
 
@@ -34456,6 +34640,193 @@ function compareResponses(before, after, oldOperation, newOperation, where, repo
             reportAdded(comparison, key, oldResponses, newResponses, where, report);
         }
     }
+}
+
+
+/***/ }),
+
+/***/ 9244:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/**
+ * The catalogue of rule codes the comparison engine can report.
+ *
+ * It exists for the report formats only: it describes a finding, and never
+ * decides one. Whether a change is breaking is settled by the comparison rules,
+ * and the formatters take that verdict from which list a finding arrived in.
+ * A test fails when a rule code appears in the engine without an entry here.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.RULES = void 0;
+const breaking = (title, description) => ({ kind: 'breaking', title, description });
+const notice = (title, description) => ({ kind: 'notice', title, description });
+exports.RULES = {
+    OPERATION_REMOVED: breaking('Operation removed', 'A documented path and method is gone, or its whole path is gone. Clients calling it will fail.'),
+    SUCCESS_RESPONSE_REMOVED: breaking('Success response removed', 'A documented 2xx status code or 2XX range is gone from an operation and no remaining success response keeps what it promised.'),
+    PARAMETER_REMOVED: breaking('Parameter removed', 'A path-level or operation-level parameter (identified by its location and name) is gone.'),
+    PARAMETER_REQUIRED: breaking('Parameter became required', 'A parameter that was optional, or is new, is now required, so existing requests omit it.'),
+    REQUEST_BODY_REQUIRED: breaking('Request body became required', 'An operation\'s request body is now required, so existing requests that send none are rejected.'),
+    MEDIA_TYPE_REMOVED: breaking('Media type removed', 'A request or response media type is no longer offered, on any documented response including error, range and default responses.'),
+    SCHEMA_TYPE_CHANGED: breaking('Schema type changed incompatibly', 'A request no longer accepts a type it used to accept, or a response may now return a type it previously could not.'),
+    REQUEST_ENUM_NARROWED: breaking('Request enum narrowed', 'Values were removed from a request-side enum, or an enum was introduced where the value was unconstrained.'),
+    RESPONSE_ENUM_EXPANDED: breaking('Response enum expanded', 'A response enum gained values or lost its enum constraint, so deployed clients may meet values they do not handle.'),
+    REQUEST_FIELD_REQUIRED: breaking('Request field became required', 'A request-side property is newly required, so existing requests that omit it are rejected.'),
+    REQUEST_OBJECT_CLOSED: breaking('Request object closed to extra properties', 'A request object that accepted undeclared properties now sets additionalProperties to false.'),
+    REQUEST_RANGE_NARROWED: breaking('Request numeric range narrowed', 'A request\'s numeric range tightened, so values that were valid are now rejected.'),
+    RESPONSE_RANGE_WIDENED: breaking('Response numeric range widened', 'A response\'s numeric range relaxed, so it may return values outside the previously documented range.'),
+    REQUEST_LENGTH_NARROWED: breaking('Request length window narrowed', 'A request\'s minLength or maxLength window tightened, so strings that were valid are now rejected.'),
+    RESPONSE_LENGTH_WIDENED: breaking('Response length guarantee relaxed', 'A response\'s minLength or maxLength guarantee relaxed, so it may return strings outside the previous window.'),
+    REQUEST_ITEM_COUNT_NARROWED: breaking('Request item count narrowed', 'A request array\'s minItems or maxItems window tightened, so arrays that were valid are now rejected.'),
+    RESPONSE_ITEM_COUNT_WIDENED: breaking('Response item count guarantee relaxed', 'A response array\'s minItems or maxItems guarantee relaxed, so it may return arrays outside the previous window.'),
+    REQUEST_FIELD_REMOVED: breaking('Request field removed', 'A property was dropped from a request schema that does not accept additional properties.'),
+    RESPONSE_FIELD_REMOVED: breaking('Response field removed', 'A response property was removed, in a success or an error body, so clients reading it find nothing.'),
+    RESPONSE_FIELD_OPTIONAL: breaking('Response field became optional', 'A previously guaranteed (required) response property is now optional, so clients may no longer receive it.'),
+    RESPONSE_HEADER_REMOVED: breaking('Response header removed', 'A documented response header is gone. Header names are matched without regard to case.'),
+    RESPONSE_HEADER_OPTIONAL: breaking('Response header became optional', 'A response header that was required is now optional, so clients may no longer receive it.'),
+    RESPONSE_HEADER_SERIALIZATION_CHANGED: breaking('Response header serialization changed', 'The explode setting changed on an object-valued response header, so the value is written differently on the wire.'),
+    SECURITY_AUTHENTICATION_REQUIRED: breaking('Authentication now required', 'An operation that accepted unauthenticated requests now requires credentials.'),
+    SECURITY_SCHEME_REQUIRED: breaking('Additional security scheme required', 'A security requirement that used to suffice must now be combined with a further scheme.'),
+    SECURITY_SCOPE_REQUIRED: breaking('Additional scopes required', 'An OAuth2 or OpenID Connect requirement now demands scopes it did not demand before.'),
+    SECURITY_ALTERNATIVE_REMOVED: breaking('Authentication alternative removed', 'A previously accepted authentication alternative is gone and no remaining alternative is satisfied by the same credentials.'),
+    UNSUPPORTED_COMPOSITION: notice('Composed schema not analysed', 'A composed schema could not be analysed: an allOf that cannot be merged without changing its meaning, or an anyOf/oneOf change whose effect depends on whether the alternatives overlap.'),
+    UNSUPPORTED_TUPLE_ITEMS: notice('Tuple validation not analysed', 'prefixItems (tuple validation) or the array form of items is present and is not evaluated.'),
+    SCHEMA_NOT_COMPARED: notice('Schema not compared', 'A schema is declared on one side only, a parameter uses content serialisation, or a boolean schema changed, so value compatibility was not evaluated.'),
+    HEADER_NOT_COMPARED: notice('Response header change not compared', 'A response header changed in a way that is not evaluated, such as style, explode on a value of unestablished type, or a switch between schema and content.'),
+    RESPONSE_STATUS_ADDED: notice('Response status added', 'A status code, range or default response is documented where nothing described it before. Whether clients handle it cannot be established.'),
+    RESPONSE_STATUS_REMOVED: notice('Response status removed', 'A non-success status code, range or default response is gone and nothing else describes it. It may no longer be returned, or be returned undocumented.'),
+    RESPONSE_COVERAGE_CHANGED: notice('Response coverage changed', 'A status is still documented, but by a different entry whose definition could not be shown to keep what the old one promised.'),
+    SECURITY_NOT_COMPARED: notice('Security change not compared', 'A security change could not be decided because it depends on a scheme that is undefined, unsupported, renamed or redefined, or on a malformed security value.'),
+    CONSTRAINT_NOT_COMPARED: notice('Validation constraint not compared', 'A validation keyword that cannot be evaluated reliably changed, such as pattern, format, multipleOf, const, not or discriminator.'),
+};
+
+
+/***/ }),
+
+/***/ 866:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.SARIF_SCHEMA = exports.SARIF_VERSION = void 0;
+exports.buildSarif = buildSarif;
+exports.renderSarif = renderSarif;
+const node_crypto_1 = __nccwpck_require__(7598);
+const json_report_1 = __nccwpck_require__(3604);
+const report_model_1 = __nccwpck_require__(7517);
+const rules_1 = __nccwpck_require__(9244);
+const version_1 = __nccwpck_require__(311);
+exports.SARIF_VERSION = '2.1.0';
+exports.SARIF_SCHEMA = 'https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json';
+/** Where each kind of rule is documented. */
+const HELP_URI = {
+    breaking: `${version_1.TOOL_URI}#what-the-comparison-engine-detects`,
+    notice: `${version_1.TOOL_URI}#review-required-notices`,
+};
+const HELP = {
+    breaking: 'Clients built against the previous contract can break. Make the change backward compatible, '
+        + 'or release it as a new API version.',
+    notice: 'ContractGuard could not decide whether this change is compatible. Review it manually; '
+        + 'this does not fail the compatibility check.',
+};
+/** `OPERATION_REMOVED` becomes `OperationRemoved`. */
+function pascalCase(code) {
+    return code.toLowerCase().split('_').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join('');
+}
+function buildRule(code, kind) {
+    const info = (0, json_report_1.describeRule)(code, kind);
+    return {
+        id: code,
+        name: pascalCase(code),
+        shortDescription: { text: info.title },
+        fullDescription: { text: info.description },
+        help: { text: `${info.description} ${HELP[kind]}` },
+        helpUri: HELP_URI[kind],
+        defaultConfiguration: { level: json_report_1.SEVERITY[kind] },
+        properties: { tags: ['api-compatibility', kind === 'breaking' ? 'breaking-change' : 'review-required'] },
+    };
+}
+/**
+ * A stable identity for a finding, so a consumer such as Code Scanning can
+ * recognise the same finding on a later run. It is derived from the finding
+ * alone, so it does not depend on line numbers that ContractGuard cannot know.
+ */
+function fingerprint(finding) {
+    return (0, node_crypto_1.createHash)('sha256').update(`${finding.code}\n${finding.location}\n${finding.message}`).digest('hex');
+}
+/**
+ * Builds a SARIF 2.1.0 log.
+ *
+ * ContractGuard compares documents semantically and has no source coordinates
+ * for a finding, so every result carries a logical location (the operation,
+ * status and schema path it concerns). A physical location is added only when
+ * the caller states one that is true of every finding, and then only at file
+ * granularity: a file with no region. No line or column is ever produced.
+ */
+function buildSarif(result, context) {
+    // Every known rule is listed, in code order, so rule indexes do not depend on
+    // which findings a run happened to produce.
+    const kinds = new Map();
+    for (const [code, info] of Object.entries(rules_1.RULES))
+        kinds.set(code, info.kind);
+    for (const finding of result.notices)
+        if (!kinds.has(finding.code))
+            kinds.set(finding.code, 'notice');
+    for (const finding of result.breaking)
+        if (!kinds.has(finding.code))
+            kinds.set(finding.code, 'breaking');
+    const codes = [...kinds.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const indexOf = new Map(codes.map((code, index) => [code, index]));
+    const rules = codes.map(code => buildRule(code, kinds.get(code)));
+    const toResult = (finding, kind) => {
+        const location = {
+            logicalLocations: [{ name: finding.location, fullyQualifiedName: finding.location, kind: 'resource' }],
+        };
+        if (context.physicalLocationUri) {
+            location.physicalLocation = { artifactLocation: { uri: context.physicalLocationUri } };
+        }
+        return {
+            ruleId: finding.code,
+            ruleIndex: indexOf.get(finding.code),
+            level: json_report_1.SEVERITY[kind],
+            message: { text: `${finding.location}: ${finding.message}` },
+            locations: [location],
+            partialFingerprints: { 'contractguard/v1': fingerprint(finding) },
+            properties: { kind },
+        };
+    };
+    const results = [
+        ...(0, report_model_1.orderFindings)(result.breaking).map(finding => toResult(finding, 'breaking')),
+        ...(0, report_model_1.orderFindings)(result.notices).map(finding => toResult(finding, 'notice')),
+    ];
+    return {
+        $schema: exports.SARIF_SCHEMA,
+        version: exports.SARIF_VERSION,
+        runs: [{
+                tool: {
+                    driver: {
+                        name: version_1.TOOL_NAME,
+                        version: version_1.TOOL_VERSION,
+                        semanticVersion: version_1.TOOL_VERSION,
+                        informationUri: version_1.TOOL_URI,
+                        rules,
+                    },
+                },
+                // The tool ran to completion whether or not it found breaking changes.
+                invocations: [{ executionSuccessful: true }],
+                results,
+                properties: {
+                    checkedOperations: result.checkedOperations,
+                    baseline: context.baseline,
+                    head: context.head,
+                },
+            }],
+    };
+}
+function renderSarif(result, context) {
+    return `${JSON.stringify(buildSarif(result, context), null, 2)}\n`;
 }
 
 
@@ -35442,16 +35813,84 @@ function reportSchemeChanges(context, report) {
 
 /***/ }),
 
+/***/ 311:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.TOOL_URI = exports.TOOL_VERSION = exports.TOOL_NAME = void 0;
+/**
+ * Name and version stamped into machine-readable reports. A test asserts that
+ * the version matches package.json, so a release cannot forget to update it.
+ */
+exports.TOOL_NAME = 'ContractGuard';
+exports.TOOL_VERSION = '0.1.0';
+exports.TOOL_URI = 'https://github.com/Aliloraf/contractguard';
+
+
+/***/ }),
+
 /***/ 3338:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.writeRepositoryFile = writeRepositoryFile;
 exports.createDirectorySource = createDirectorySource;
 exports.createWorkspace = createWorkspace;
 const node_fs_1 = __nccwpck_require__(3024);
 const node_path_1 = __nccwpck_require__(6760);
+/**
+ * Writes a file under `boundaryRoot`, and nowhere else.
+ *
+ * The caller has already checked that `repositoryPath` is relative and inside
+ * the root. This guards what the path *meets on disk*: in a checkout of an
+ * untrusted change, any directory or the file itself may have been replaced by
+ * a symbolic link that leads outside the repository. So every component is
+ * inspected without following links, a link anywhere is refused, a directory or
+ * other special file at the target is refused, and the file is opened with
+ * `O_NOFOLLOW` so a link swapped in after the check is refused as well.
+ */
+function writeRepositoryFile(boundaryRoot, repositoryPath, contents) {
+    const parts = repositoryPath.split('/').filter(part => part !== '');
+    if (parts.length === 0 || parts.includes('..') || parts.includes('.')) {
+        throw new Error('the path is not a plain relative file path');
+    }
+    let current = (0, node_path_1.resolve)(boundaryRoot);
+    for (let index = 0; index < parts.length; index++) {
+        current = (0, node_path_1.join)(current, parts[index]);
+        const last = index === parts.length - 1;
+        let stats;
+        try {
+            stats = (0, node_fs_1.lstatSync)(current);
+        }
+        catch (error) {
+            if (error.code !== 'ENOENT')
+                throw error;
+            if (!last)
+                (0, node_fs_1.mkdirSync)(current);
+            continue;
+        }
+        if (stats.isSymbolicLink())
+            throw new Error(`"${parts.slice(0, index + 1).join('/')}" is a symbolic link, which is never followed`);
+        if (!last && !stats.isDirectory())
+            throw new Error(`"${parts.slice(0, index + 1).join('/')}" is not a directory`);
+        if (last && !stats.isFile())
+            throw new Error(`"${repositoryPath}" exists and is not a regular file`);
+    }
+    const descriptor = (0, node_fs_1.openSync)(current, node_fs_1.constants.O_WRONLY | node_fs_1.constants.O_CREAT | node_fs_1.constants.O_TRUNC | (node_fs_1.constants.O_NOFOLLOW ?? 0), 0o644);
+    try {
+        const data = Buffer.from(contents, 'utf8');
+        let offset = 0;
+        while (offset < data.length)
+            offset += (0, node_fs_1.writeSync)(descriptor, data, offset, data.length - offset);
+    }
+    finally {
+        (0, node_fs_1.closeSync)(descriptor);
+    }
+}
 /**
  * Reads referenced files from a directory tree, never leaving it.
  *
@@ -35552,6 +35991,7 @@ function createWorkspace(workspace) {
         read(absolutePath) {
             return (0, node_fs_1.readFileSync)(absolutePath, 'utf8');
         },
+        writeFile: writeRepositoryFile,
         source(boundaryRoot, origin) {
             return createDirectorySource(boundaryRoot, 'the repository', origin);
         },

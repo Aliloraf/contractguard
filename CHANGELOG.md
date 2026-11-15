@@ -71,6 +71,41 @@ Relaxations (security removed, an alternative added, a scope or combined scheme 
 equivalent spellings (reordering, repetition, `[]` versus `[{}]`, a requirement moved between
 the document and its operations) are recognised as compatible and reported as nothing.
 
+**JSON and SARIF reports.** The comparison can now be exported in machine-readable form, in
+addition to the Markdown report, which is unchanged and still the default.
+
+- **JSON** (`schemaVersion` `1.0`, described by `schema/report-1.0.schema.json`): tool name and
+  version, the two sides compared (path and Git revision where known), summary counts and a
+  `compatible`/`breaking` status, the breaking findings and the review-required notices with their
+  stable rule codes, logical locations, messages and a machine-readable `error`/`warning`
+  severity, and a description of each rule that fired.
+- **SARIF 2.1.0**, validated in the test suite against the official OASIS schema: tool driver
+  metadata, every rule with descriptions, help text and default level, results at level `error`
+  (breaking) and `warning` (notices), stable `partialFingerprints`, and logical locations. No
+  line, column or region is ever emitted. In the Action, when the head specification is a single
+  file, each result also names that file (file level only) so Code Scanning can display it;
+  results for multi-file specifications stay logical-only.
+- Both formats use the findings the comparison already produces, with no second implementation of
+  any rule, and are ordered by code point and free of timestamps and machine paths, so identical
+  inputs give identical bytes.
+
+CLI: `--format markdown|json|sarif` selects what is printed (default `markdown`) and `--output
+<file>` writes it to a file instead. With JSON or SARIF, stdout carries only the document;
+errors go to stderr. An unknown format or an unusable output path (missing directory, a
+directory, or one of the compared specifications) exits `2` before anything is printed. `--report`
+still writes Markdown. Exit codes, existing flags and the default output are unchanged.
+
+Action: new optional inputs `json-report-path` and `sarif-report-path` write the reports to files
+in the checkout, and matching outputs report the path written. Paths are validated before the
+comparison (relative, inside the repository, outside `.git`, not the specification) and written
+without following symbolic links, so a link planted in a pull request cannot redirect the write.
+The Action never uploads a report and needs no additional permission; the README shows how to
+upload the SARIF file to Code Scanning with `github/codeql-action/upload-sarif`. Existing inputs,
+outputs, the job summary and the optional comment are unchanged.
+
+Development: `ajv` and `ajv-draft-04` are added as dev dependencies for schema validation in
+tests; they are not part of the bundled Action.
+
 **Multi-file specifications.** Documents split across local YAML and JSON files are now
 followed through relative `$ref`s, in the CLI and in the GitHub Action: whole files
 (`./schemas/User.yaml`), JSON Pointer fragments (`./common.yaml#/components/parameters/PageSize`,
