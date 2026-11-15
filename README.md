@@ -54,9 +54,9 @@ npm run cli -- --base examples/before.yaml --head examples/after.yaml
 | | |
 | --- | --- |
 | **Catches** | removed operations, parameters, success responses and media types; newly required parameters, bodies and fields; request enums narrowed; response enums widened; numeric, length and item-count ranges tightened for requests or relaxed for responses; objects closed to extra properties; response fields removed or made optional; type changes, directionally, with `integer` understood as part of `number`; response headers removed, made optional or changed in type, constraints or serialisation; the same body and header rules on documented error, range and `default` responses; authentication made mandatory, extra security schemes or OAuth2/OpenID Connect scopes required, and accepted authentication alternatives removed |
-| **Understands** | OpenAPI 3.0 and 3.1, YAML and JSON, internal `$ref` (including recursion), nested objects and arrays, `allOf` wherever it can be merged without changing meaning, and response status keys the way OpenAPI resolves them: an explicit code, then its `nXX` range, then `default`, and `security` as an access rule: document defaults, operation overrides, `security: []`, optional authentication, alternatives (OR) and combined schemes (AND) |
+| **Understands** | OpenAPI 3.0 and 3.1, YAML and JSON, internal and local multi-file `$ref` (including recursion, see [Multi-file specifications](#multi-file-specifications)), nested objects and arrays, `allOf` wherever it can be merged without changing meaning, and response status keys the way OpenAPI resolves them: an explicit code, then its `nXX` range, then `default`, and `security` as an access rule: document defaults, operation overrides, `security: []`, optional authentication, alternatives (OR) and combined schemes (AND) |
 | **Reports for review instead of guessing** | `anyOf`/`oneOf` changes whose effect depends on overlapping alternatives, `allOf` that cannot be merged safely, `pattern`, `format`, `multipleOf` and other constraints needing instance-level reasoning, `security` changes that hinge on a renamed, redefined or undefined scheme, and documented statuses that were added, removed or moved between an explicit code, a range and `default` |
-| **Does not check** | external or multi-file `$ref`, response `links`, media type ranges, `servers`, `webhooks`, `callbacks`, or anything else in [the limitations](#what-the-engine-does-not-support) |
+| **Does not check** | remote (`http`/`https`) `$ref`, response `links`, media type ranges, `servers`, `webhooks`, `callbacks`, or anything else in [the limitations](#what-the-engine-does-not-support) |
 
 A clean report is not a proof of compatibility. Everything the engine cannot evaluate is
 listed explicitly as a review-required notice rather than passed over in silence.
@@ -372,6 +372,105 @@ side by side. The analysis models whether a request is *admitted*; it does not m
 an authenticated caller is entitled to, so removing an authenticated alternative while
 unauthenticated access remains is treated as compatible.
 
+## Multi-file specifications
+
+A specification may be split across local YAML and JSON files. Both the CLI and the GitHub
+Action follow relative `$ref`s, and **each side of a comparison resolves its own files**: the
+baseline from the baseline revision, the new specification from the new revision. A schema
+changed in `schemas/User.yaml` is reported even when `openapi.yaml` is untouched.
+
+```yaml
+# openapi.yaml
+openapi: 3.1.0
+info: { title: Shop, version: 1.0.0 }
+paths:
+  /users:
+    $ref: ./paths/users.yaml                       # a whole path item
+  /orders:
+    get:
+      parameters:
+        - $ref: ./common/parameters.yaml#/components/parameters/PageSize
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: ./schemas/Order.json }
+```
+
+```yaml
+# paths/users.yaml  (resolved relative to paths/, not to the root document)
+get:
+  responses:
+    '200':
+      description: ok
+      content:
+        application/json:
+          schema: { $ref: ../schemas/User.yaml }
+```
+
+```yaml
+# schemas/User.yaml
+type: object
+required: [id]
+properties:
+  id: { type: string }
+  manager: { $ref: '#' }                           # recursion within the file
+  address: { $ref: ./address/Address.yaml }        # schemas/address/Address.yaml
+```
+
+### How references are resolved
+
+- A relative reference resolves against **the file that contains it**. `./address/Address.yaml`
+  inside `schemas/User.yaml` means `schemas/address/Address.yaml`. A `#/...` reference inside a
+  referenced file points into *that* file, not the root document.
+- Every referenced file is loaded once, however often it is reached, and loaded files are
+  never merged by copying: references stay references. A recursive or mutually recursive
+  schema therefore stays recursive across files, and is compared with the same cycle handling
+  as an internal recursion. A reference chain that never reaches a definition (`a` → `b` → `a`)
+  is rejected as malformed.
+- Moving a schema into another file, or splitting a document up, does not change what is
+  reported: the comparison is of the resolved contract, not of file layout.
+- Any failure to resolve a reference — a missing file, a pointer that does not exist, bad
+  YAML/JSON, an unsupported or unsafe reference — **fails the run** (exit code `2`, or a failed
+  Action step) with a message naming the reference, the file that contains it and where. It is
+  never reported as compatible.
+
+### Supported and unsupported references
+
+| Reference | Supported |
+| --- | --- |
+| `#/components/schemas/X` (internal) | yes |
+| `./schemas/User.yaml`, `../shared/Id.yml`, `./Order.json` (whole file) | yes |
+| `./common.yaml#/components/parameters/PageSize` (file and JSON Pointer) | yes |
+| JSON Pointer escapes `~0` and `~1`, percent-encoding (`%7Bid%7D`, `%20`), array indexes (`#/items/0`) | yes |
+| Targets that are schemas, parameters, headers, responses, request bodies, path items, security schemes and other objects | yes |
+| Nested, chained, recursive and mutually recursive references across files | yes |
+| `http://` / `https://` references | **no** — never fetched |
+| `file:` and any other URI scheme, `//host/...`, absolute paths (`/etc/x.yaml`, `C:/x.yaml`) | **no** |
+| Anchors and named fragments (`#node`), `$id` / `$anchor` / `$dynamicRef` resolution | **no** |
+| Query strings, backslashes, directories, and files that are not `.yaml`, `.yml` or `.json` | **no** |
+| A reference to the whole root document (`../openapi.yaml`) | **no**; a pointer into it (`../openapi.yaml#/components/schemas/X`) is supported |
+| `discriminator.mapping` values that name files | not followed (the mapping is compared as text and raises a notice when it changes) |
+| `$ref` inside `example`, `examples[].value`, `default`, `enum`, `const` and `x-` extensions | not followed — it is data |
+
+### Security restrictions
+
+- **No network access.** Only local files are ever read.
+- **Confined to a boundary.** In the Action the boundary is the repository root; a reference
+  that resolves above it (`../../outside.yaml`, `%2e%2e/`, …) is rejected. In the CLI it is the
+  directory of each document, widened only by an explicit `--base-root` / `--head-root`.
+- **Symbolic links are never followed**, whether the link is the file or a directory on the
+  way to it, whether it points outside or inside the boundary, in the working tree or committed
+  in Git history. (A link in Git is a blob holding its target path; ContractGuard recognises it
+  by file mode instead of parsing the path text as a document.)
+- **Bounded work.** At most 500 referenced files, 10 MiB per file, 64 MiB in total, 5 million
+  values walked and 128 levels of nesting per file; YAML alias expansion is capped by the
+  parser. Exceeding a limit is an error, not a truncation.
+- **No shell.** Paths from a specification go to Git as arguments of `spawnSync` with
+  `shell: false`, and to the filesystem as paths; nothing is interpolated into a command.
+- `.git` directories are not readable through a reference.
+
 ## Review-required notices
 
 Silently skipping a construct the engine cannot evaluate would make a clean report
@@ -392,8 +491,10 @@ check and **do not** change the CLI exit code; they tell you where a human still
 
 ## What the engine does **not** support
 
-- **External or multi-file `$ref`** — any `$ref` that does not start with `#/` is rejected
-  with an error (deliberate: it avoids network fetches on untrusted input).
+- **Remote and non-file `$ref`** — `http`, `https`, `file:` and every other URI scheme,
+  absolute paths, anchors (`#name`), `$id`-based resolution and `$dynamicRef` are rejected with
+  an error naming the reference. Local relative files are supported; see
+  [Multi-file specifications](#multi-file-specifications) for the full list.
 - **`anyOf` / `oneOf` subsumption** — no overlap or containment analysis is attempted
   between alternatives, so only the provable cases above produce a verdict and every other
   change is a notice. Changes *inside* an alternative are never compared branch by branch.
@@ -489,7 +590,7 @@ Available scripts:
 ## CLI usage
 
 ```bash
-npm run cli -- --base <old-spec> --head <new-spec> [--report <file.md>]
+npm run cli -- --base <old-spec> --head <new-spec> [--base-root <dir>] [--head-root <dir>] [--report <file.md>]
 ```
 
 Example, using the specs committed under `examples/`:
@@ -502,7 +603,21 @@ Flags:
 
 - `--base` *(required)* — path to the previous/current contract.
 - `--head` *(required)* — path to the proposed contract.
+- `--base-root` / `--head-root` *(optional)* — the directory tree that referenced files may
+  live in, for the base and head document respectively. It defaults to the document's own
+  directory, so `$ref: ../shared/User.yaml` needs a root that contains `shared/`. Nothing
+  outside the root is read.
 - `--report` *(optional)* — also write the Markdown report to this file.
+
+Documents that reference other local files are followed automatically; see
+[Multi-file specifications](#multi-file-specifications). Two checkouts or two directories work
+as-is, each side resolving its own files:
+
+```bash
+npm run cli -- --base ../main-checkout/openapi.yaml --head openapi.yaml
+# a shared directory above the specifications:
+npm run cli -- --base old/api/openapi.yaml --base-root old --head new/api/openapi.yaml --head-root new
+```
 
 The report is printed to stdout. Exit codes:
 
@@ -512,11 +627,12 @@ The report is printed to stdout. Exit codes:
 | `1` | At least one potentially breaking change found. |
 | `2` | Invalid usage, unreadable file, or an unsupported/invalid specification. |
 
-To compare two git revisions by hand:
+To compare two git revisions by hand, check the base out beside the working tree so its
+referenced files come with it (a single `git show` would leave them behind):
 
 ```bash
-git show main:openapi.yaml > /tmp/base.yaml
-npm run cli -- --base /tmp/base.yaml --head openapi.yaml
+git worktree add ../base-checkout main
+npm run cli -- --base ../base-checkout/openapi.yaml --head openapi.yaml
 ```
 
 ---
@@ -547,6 +663,28 @@ If that common ancestor cannot be found — almost always a clone too shallow to
 shared history — the step **fails with guidance naming `fetch-depth: 0`**. ContractGuard never
 falls back to a different commit, because measuring against the wrong baseline can report
 changes a pull request did not make, or miss ones it did.
+
+### Multi-file specifications in the Action
+
+Nothing changes in the workflow: point `spec-path` at the **root** document and keep
+`fetch-depth: 0`.
+
+```yaml
+- uses: actions/checkout@v7
+  with:
+    fetch-depth: 0
+- uses: Aliloraf/contractguard@v0.1.0
+  with:
+    spec-path: api/openapi.yaml   # references such as ../schemas/User.yaml are followed
+```
+
+The head's referenced files are read from the checkout; the baseline's are read from the
+baseline commit with `git`, never from the working tree. So a pull request that only edits
+`schemas/User.yaml` is compared against `schemas/User.yaml` as it was at the baseline, and a
+file that was added, moved or deleted resolves correctly on each side. References may reach
+anywhere inside the repository (not only below the specification's directory) and nothing
+outside it. If a referenced file is missing, unreadable, a symbolic link or malformed on either
+side, the step fails and names the side.
 
 ### Pinning a version
 
@@ -702,8 +840,10 @@ end-to-end behaviour on GitHub is worth confirming once per release:
 
 - Specifications from pull requests are treated as **data**, never code. ContractGuard
   does not execute anything from the changed repository.
-- Remote/external `$ref` pointers are rejected, so no network requests are made while
-  resolving a specification.
+- Remote `$ref` pointers are rejected, so no network requests are made while resolving a
+  specification. Local file references are confined to the repository (Action) or the
+  document's directory tree (CLI), never follow symbolic links, and are bounded in file
+  count, size, nesting and total work; see [Security restrictions](#security-restrictions).
 - **No shell is ever involved.** Git runs through `spawnSync` with an explicit argument list
   and `shell: false`, so nothing in a path, ref or other input can be interpreted as a
   command. A specification at `my api $(touch pwned).yaml` is read as a filename, and a
@@ -735,7 +875,7 @@ end-to-end behaviour on GitHub is worth confirming once per release:
    analysis, response headers, error responses and
    status ranges, explicit review-required notices *(current)*; still to come: `anyOf`/`oneOf` subsumption analysis, broader third-party
    fixtures.
-3. **v0.3** — inline PR annotations, ignore/config rules, JSON diff export, multi-file `$ref`,
+3. **v0.3** — inline PR annotations, ignore/config rules, JSON diff export,
    multiple specification paths per run.
 4. **v1.0** — full compatibility suite, published versioned Action, example repositories.
 

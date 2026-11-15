@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
-import type { GitAccess } from './integration';
+import type { GitAccess, GitEntry } from './integration';
+import type { DocumentSource, SourceRead } from './references';
 
 /** Generous enough for large specifications, bounded so a runaway cannot grow without limit. */
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
@@ -63,12 +64,58 @@ export function createGitAccess(cwd: string): GitAccess {
     fileExistsAt(commit: string, repositoryPath: string): boolean {
       return run(['cat-file', '-e', `${commit}:${repositoryPath}`]).status === 0;
     },
+    entryAt(commit: string, repositoryPath: string): GitEntry | null {
+      // `--full-tree` makes the path repository-relative whatever the working
+      // directory is, `-z` leaves the path unquoted, and `--literal-pathspecs`
+      // stops `*`, `?`, `[` and a leading `:` in a file name acting as a pattern.
+      const result = run(['--literal-pathspecs', 'ls-tree', '--long', '--full-tree', '-z', commit, '--', repositoryPath]);
+      if (result.status !== 0) return null;
+      const line = result.stdout.split('\0')[0] ?? '';
+      const match = /^(\d+) (\w+) [0-9a-f]+ +(\d+|-)\t([\s\S]*)$/.exec(line);
+      if (!match || match[4] !== repositoryPath) return null;
+      return { mode: match[1], type: match[2], size: match[3] === '-' ? 0 : Number(match[3]) };
+    },
     readFileAt(commit: string, repositoryPath: string): string {
       const result = run(['show', `${commit}:${repositoryPath}`]);
       if (result.status !== 0) {
         throw new Error(result.stderr.trim() || `git show exited with status ${result.status}`);
       }
       return result.stdout;
+    },
+  };
+}
+
+/**
+ * Reads referenced files from one Git revision, so the baseline resolves every
+ * dependency from the baseline commit and never from the working tree.
+ *
+ * A symbolic link is stored in Git as a blob holding its target path. Reading
+ * it as a file would silently parse that path as the document, so a link, or a
+ * path that passes through one, is refused by name instead.
+ */
+export function createRevisionSource(git: GitAccess, commit: string, boundary: string, origin: string): DocumentSource {
+  const SYMLINK_MODE = '120000';
+  return {
+    boundary,
+    origin,
+    read(path: string, maxBytes: number): SourceRead {
+      const entry = git.entryAt(commit, path);
+      if (entry === null) {
+        const parts = path.split('/');
+        for (let length = 1; length < parts.length; length++) {
+          const ancestor = git.entryAt(commit, parts.slice(0, length).join('/'));
+          if (ancestor !== null && ancestor.mode === SYMLINK_MODE) return { status: 'symlink' };
+        }
+        return { status: 'missing' };
+      }
+      if (entry.mode === SYMLINK_MODE) return { status: 'symlink' };
+      if (entry.type !== 'blob') return { status: 'not-file' };
+      if (entry.size > maxBytes) return { status: 'too-large', limit: maxBytes };
+      try {
+        return { status: 'ok', text: git.readFileAt(commit, path) };
+      } catch (error) {
+        return { status: 'unreadable', detail: error instanceof Error ? error.message.split('\n')[0] : String(error) };
+      }
     },
   };
 }

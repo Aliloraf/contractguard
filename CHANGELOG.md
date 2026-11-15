@@ -71,6 +71,39 @@ Relaxations (security removed, an alternative added, a scope or combined scheme 
 equivalent spellings (reordering, repetition, `[]` versus `[{}]`, a requirement moved between
 the document and its operations) are recognised as compatible and reported as nothing.
 
+**Multi-file specifications.** Documents split across local YAML and JSON files are now
+followed through relative `$ref`s, in the CLI and in the GitHub Action: whole files
+(`./schemas/User.yaml`), JSON Pointer fragments (`./common.yaml#/components/parameters/PageSize`,
+with `~0`/`~1` escapes, percent-encoding and array indexes), and targets of any kind — schemas,
+parameters, headers, responses, request bodies, path items and security schemes. A reference
+resolves against the file that contains it, a `#/...` reference inside a referenced file points
+into that file, and each file is loaded once. Referenced files are folded into a single
+document with their references rewritten, never inlined, so recursive and cross-file mutually
+recursive schemas keep the engine's existing cycle handling. Splitting a document, or moving a
+schema between files, does not change what is reported.
+
+Each side of a comparison resolves its own files. In the Action the baseline's files are read
+from the baseline commit with `git`, never from the working tree, so a pull request that only
+changes a referenced file is compared against that file as it was at the baseline, and a
+breaking change there is reported even though `openapi.yaml` is unchanged. Files added, moved
+or deleted between revisions resolve correctly on each side.
+
+The CLI gains `--base-root` and `--head-root` to widen the directory that referenced files may
+live in (the default is each document's own directory). Single-file usage, Action inputs and
+outputs, and exit codes are unchanged.
+
+Failures are explicit and deterministic and never read as compatible: a missing file, a pointer
+that does not exist, malformed YAML/JSON, an unsupported reference, a reference chain that never
+reaches a definition, or an exceeded limit fails the run (CLI exit `2`, failed Action step) with a
+message naming the reference, the file that contains it and where.
+
+Security: no remote (`http`/`https`) or other URI-scheme reference is ever fetched; references
+cannot leave the repository (Action) or the document's directory tree (CLI); symbolic links are
+never followed, in the working tree or in Git history; only `.yaml`, `.yml` and `.json` files are
+read; and loading is bounded (500 files, 10 MiB per file, 64 MiB in total, 5 million values,
+128 levels of nesting). Not supported: anchors and named fragments, `$id`/`$dynamicRef`
+resolution, and file names in `discriminator.mapping`.
+
 ### Fixed
 
 **Schema changes that went unreported.** Whether a schema changed is decided on a canonical
@@ -123,6 +156,8 @@ or `{}` is the same as leaving it out.
 
 ### Changed
 
+- Pointer resolution now accepts array indexes (`#/paths/~1users/get/parameters/0`), which
+  an internal reference could not follow before.
 - **Upgrade note:** the fixes above surface changes that used to pass unnoticed. Most
   arrive as review notices (`UNSUPPORTED_COMPOSITION`, `CONSTRAINT_NOT_COMPARED`,
   `SCHEMA_NOT_COMPARED`), which do not fail the check. Three can now fail it: constraints
@@ -139,8 +174,8 @@ or `{}` is the same as leaving it out.
   removed success response.
 - `MEDIA_TYPE_REMOVED`, `SCHEMA_NOT_COMPARED` and the schema rules now also apply to
   non-`2xx` responses and to response headers.
-- External or unresolvable `$ref`s inside non-`2xx` responses and response headers are now
-  rejected with the same error as anywhere else; previously those parts were never read.
+- Unresolvable `$ref`s inside non-`2xx` responses and response headers are now rejected with
+  the same error as anywhere else; previously those parts were never read.
 - **Upgrade note:** changes to error responses and response headers that used to go
   unreported can now fail the check, and newly documented or removed statuses now raise
   notices. Exit codes and Action outputs are unchanged in meaning.

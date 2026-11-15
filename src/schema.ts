@@ -95,16 +95,38 @@ function pointerSegments(ref: string): string[] {
   return ref.slice(2).split('/').map(segment => segment.replace(/~1/g, '/').replace(/~0/g, '~'));
 }
 
+/**
+ * One step of a JSON Pointer walk: an own property of an object, or a canonical
+ * decimal index of an array. Anything else, including inherited names such as
+ * `constructor`, is absent.
+ */
+export function childOf(value: unknown, key: string): unknown {
+  if (Array.isArray(value)) {
+    return /^(0|[1-9][0-9]*)$/.test(key) ? value[Number(key)] : undefined;
+  }
+  if (value !== null && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, key)) {
+    return (value as JsonObject)[key];
+  }
+  return undefined;
+}
+
+/** The value an internal `#/...` pointer names, or `undefined` when nothing is there. */
+export function lookupPointer(root: unknown, ref: string): unknown {
+  let target: unknown = root;
+  for (const key of pointerSegments(ref)) {
+    target = childOf(target, key);
+    if (target === undefined) return undefined;
+  }
+  return target;
+}
+
 /** Follows one internal reference. */
 function dereference(root: JsonObject, ref: string): JsonObject {
   if (!ref.startsWith('#/')) {
     throw new Error(`Only internal OpenAPI references are supported: ${ref}`);
   }
-  let target: unknown = root;
-  for (const key of pointerSegments(ref)) {
-    target = record(target)[key];
-    if (target === undefined) throw new Error(`Unresolved OpenAPI reference: ${ref}`);
-  }
+  const target = lookupPointer(root, ref);
+  if (target === undefined) throw new Error(`Unresolved OpenAPI reference: ${ref}`);
   return record(target);
 }
 
@@ -453,11 +475,7 @@ function canonicalSchema(state: CanonicalState, value: unknown): unknown {
     state.reentered.add(ref);
     resolved = { $cyclicRef: ref };
   } else {
-    let target: unknown = state.doc.root;
-    for (const key of pointerSegments(ref)) {
-      target = record(target)[key];
-      if (target === undefined) break;
-    }
+    const target = lookupPointer(state.doc.root, ref);
     if (target === undefined) resolved = { $unresolvedRef: ref };
     else {
       state.activeRefs.add(ref);
