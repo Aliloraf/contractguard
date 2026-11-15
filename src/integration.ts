@@ -1,5 +1,7 @@
 import { compareSpecifications } from './comparator';
+import { createRevisionSource } from './git';
 import { loadSpecification } from './load';
+import type { DocumentSource } from './references';
 import { REPORT_MARKER, renderMarkdown } from './report';
 
 /** A commit-ish accepted from the event payload, before it reaches Git. */
@@ -38,6 +40,15 @@ export interface EventContext {
 }
 
 /** Read-only Git access. Every implementation must pass arguments explicitly. */
+export interface GitEntry {
+  /** Git file mode, such as `100644`, or `120000` for a symbolic link. */
+  mode: string;
+  /** `blob`, `tree` or `commit`. */
+  type: string;
+  /** Size in bytes for a blob. */
+  size: number;
+}
+
 export interface GitAccess {
   /** Absolute path of the working tree root, or `null` when there is none. */
   repositoryRoot(): string | null;
@@ -47,6 +58,11 @@ export interface GitAccess {
   /** The best common ancestor, or `null` when there is none or Git failed. */
   mergeBase(left: string, right: string): string | null;
   fileExistsAt(commit: string, repositoryPath: string): boolean;
+  /**
+   * What the tree of `commit` holds at `repositoryPath`, without following
+   * links, or `null` when nothing is there.
+   */
+  entryAt(commit: string, repositoryPath: string): GitEntry | null;
   readFileAt(commit: string, repositoryPath: string): string;
 }
 
@@ -61,6 +77,11 @@ export interface FileAccess {
   relativeTo(root: string, absolute: string): string | null;
   exists(absolutePath: string): boolean;
   read(absolutePath: string): string;
+  /**
+   * A reader for files referenced by a specification, confined to `boundaryRoot`
+   * and refusing symbolic links.
+   */
+  source(boundaryRoot: string, origin: string): DocumentSource;
 }
 
 export interface ActionIo {
@@ -219,9 +240,14 @@ function resolveBaseline(pr: PullRequestContext, git: GitAccess, io: ActionIo): 
   return { sha: mergeBase, description: `merge base ${short(mergeBase)}` };
 }
 
-function parseSpecification(text: string, origin: string): ReturnType<typeof loadSpecification> {
+function parseSpecification(
+  text: string,
+  origin: string,
+  path: string,
+  source: DocumentSource,
+): ReturnType<typeof loadSpecification> {
   try {
-    return loadSpecification(text);
+    return loadSpecification(text, { path, source });
   } catch (error) {
     fail(`The specification from ${origin} could not be read: ${describe(error)}`);
   }
@@ -339,8 +365,17 @@ async function execute(env: ActionEnvironment): Promise<ActionOutcome> {
     fail(`Could not read "${spec.repositoryPath}" from the checkout: ${describe(error)}`);
   }
 
-  const baseSpec = parseSpecification(baseText, `the ${baseline.description}`);
-  const headSpec = parseSpecification(headText, 'this pull request');
+  // Each side resolves its references from its own revision: the baseline from
+  // the baseline commit, the head from the checkout. Both sources are created on
+  // first use, so a single-file specification never touches them.
+  const baseSource = createRevisionSource(git, baseline.sha, 'the repository', `the ${baseline.description}`);
+  const headSource: DocumentSource = {
+    boundary: 'the repository',
+    origin: 'this pull request',
+    read: (path, maxBytes) => files.source(root, 'this pull request').read(path, maxBytes),
+  };
+  const baseSpec = parseSpecification(baseText, `the ${baseline.description}`, spec.repositoryPath, baseSource);
+  const headSpec = parseSpecification(headText, 'this pull request', spec.repositoryPath, headSource);
   const result = compareSpecifications(baseSpec, headSpec);
   const report = renderMarkdown(result);
   const breakingCount = result.breaking.length;
