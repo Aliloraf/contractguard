@@ -89,6 +89,8 @@ async function main(): Promise<void> {
         specPath: core.getInput('spec-path', { required: true }),
         comment,
         githubToken: token,
+        jsonReportPath: core.getInput('json-report-path'),
+        sarifReportPath: core.getInput('sarif-report-path'),
       },
       context,
       git: createGitAccess(workspace),

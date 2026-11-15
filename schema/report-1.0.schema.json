@@ -1,0 +1,83 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/Aliloraf/contractguard/blob/main/schema/report-1.0.schema.json",
+  "title": "ContractGuard JSON report, schema version 1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "tool", "comparison", "summary", "breaking", "notices", "rules"],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "informationUri"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "informationUri": { "type": "string" }
+      }
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseline", "head"],
+      "properties": {
+        "baseline": { "$ref": "#/definitions/side" },
+        "head": { "$ref": "#/definitions/side" }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "breaking", "notices", "checkedOperations"],
+      "properties": {
+        "status": { "enum": ["compatible", "breaking"] },
+        "breaking": { "type": "integer", "minimum": 0 },
+        "notices": { "type": "integer", "minimum": 0 },
+        "checkedOperations": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "breaking": { "type": "array", "items": { "$ref": "#/definitions/finding" } },
+    "notices": { "type": "array", "items": { "$ref": "#/definitions/finding" } },
+    "rules": { "type": "array", "items": { "$ref": "#/definitions/rule" } }
+  },
+  "definitions": {
+    "side": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "revision"],
+          "properties": {
+            "path": { "type": "string" },
+            "revision": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "location", "message"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+        "severity": { "enum": ["error", "warning"] },
+        "location": { "type": "string" },
+        "message": { "type": "string" }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "kind", "severity", "title", "description"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+        "kind": { "enum": ["breaking", "notice"] },
+        "severity": { "enum": ["error", "warning"] },
+        "title": { "type": "string" },
+        "description": { "type": "string" }
+      }
+    }
+  }
+}

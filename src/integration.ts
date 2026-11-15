@@ -1,8 +1,12 @@
 import { compareSpecifications } from './comparator';
 import { createRevisionSource } from './git';
 import { loadSpecification } from './load';
+import { EXTERNAL_FILES_KEY } from './references';
 import type { DocumentSource } from './references';
 import { REPORT_MARKER, renderMarkdown } from './report';
+import { renderReport } from './report-format';
+import type { ReportFormat } from './report-format';
+import type { ReportContext } from './report-model';
 
 /** A commit-ish accepted from the event payload, before it reaches Git. */
 const SHA_PATTERN = /^[0-9a-f]{7,64}$/;
@@ -19,6 +23,10 @@ export interface ActionInputs {
   specPath: string;
   comment: boolean;
   githubToken: string;
+  /** Repository-relative file to write the JSON report to; empty or absent for none. */
+  jsonReportPath?: string;
+  /** Repository-relative file to write the SARIF report to; empty or absent for none. */
+  sarifReportPath?: string;
 }
 
 export interface PullRequestContext {
@@ -77,6 +85,12 @@ export interface FileAccess {
   relativeTo(root: string, absolute: string): string | null;
   exists(absolutePath: string): boolean;
   read(absolutePath: string): string;
+  /**
+   * Writes `contents` to `repositoryPath` under `boundaryRoot`, creating missing
+   * directories. Refuses symbolic links anywhere on the path, and refuses
+   * anything that is not a regular file.
+   */
+  writeFile(boundaryRoot: string, repositoryPath: string, contents: string): void;
   /**
    * A reader for files referenced by a specification, confined to `boundaryRoot`
    * and refusing symbolic links.
@@ -181,9 +195,50 @@ function locateSpecification(input: string, root: string, files: FileAccess): Sp
   return { absolute, repositoryPath };
 }
 
+interface ReportDestination {
+  format: ReportFormat;
+  input: string;
+  repositoryPath: string;
+}
+
+/**
+ * Validates where a report file may be written. The path comes from workflow
+ * input, so it must stay inside the checkout and may not name the
+ * specification, anything under `.git`, or the other report.
+ */
+function locateReport(
+  inputName: string,
+  value: string | undefined,
+  format: ReportFormat,
+  root: string,
+  files: FileAccess,
+  specPath: string,
+): ReportDestination | null {
+  const requested = (value ?? '').trim();
+  if (requested === '') return null;
+  if (requested.includes('\0')) fail(`${inputName} must not contain NUL characters.`);
+  if (files.isAbsolute(requested) || /^[A-Za-z]:/.test(requested) || requested.startsWith('\\')) {
+    fail(`${inputName} must be relative to the repository, but "${value}" is an absolute path.`);
+  }
+  const repositoryPath = files.relativeTo(root, files.resolve(requested));
+  if (repositoryPath === null || repositoryPath === '') {
+    fail(`${inputName} must point to a file inside the repository, but "${value}" resolves outside it.`);
+  }
+  if (repositoryPath.split('/').includes('.git')) {
+    fail(`${inputName} must not point inside the .git directory.`);
+  }
+  if (requested.endsWith('/') || requested.endsWith('\\')) fail(`${inputName} must name a file, not a directory.`);
+  if (repositoryPath === specPath) {
+    fail(`${inputName} must not be the specification itself ("${specPath}"); it would overwrite it.`);
+  }
+  return { format, input: requested, repositoryPath };
+}
+
 interface Baseline {
   sha: string;
   description: string;
+  /** The commit that is checked out, which is what the head side was read from. */
+  head: string;
 }
 
 /**
@@ -233,11 +288,11 @@ function resolveBaseline(pr: PullRequestContext, git: GitAccess, io: ActionIo): 
     : 'a merge of the pull request into the base branch';
   if (mergeBase === baseSha) {
     io.info(`Comparing ${headNote} (${short(head)}) against the base commit ${short(baseSha)}.`);
-    return { sha: mergeBase, description: `base commit ${short(baseSha)}` };
+    return { sha: mergeBase, description: `base commit ${short(baseSha)}`, head };
   }
   io.info(`Comparing ${headNote} (${short(head)}) against the merge base ${short(mergeBase)}; `
     + `the base branch is now at ${short(baseSha)}.`);
-  return { sha: mergeBase, description: `merge base ${short(mergeBase)}` };
+  return { sha: mergeBase, description: `merge base ${short(mergeBase)}`, head };
 }
 
 function parseSpecification(
@@ -345,6 +400,15 @@ async function execute(env: ActionEnvironment): Promise<ActionOutcome> {
       + 'ContractGuard will not report a missing specification as compatible.');
   }
 
+  const reports: ReportDestination[] = [];
+  const json = locateReport('json-report-path', inputs.jsonReportPath, 'json', root, files, spec.repositoryPath);
+  const sarif = locateReport('sarif-report-path', inputs.sarifReportPath, 'sarif', root, files, spec.repositoryPath);
+  if (json !== null) reports.push(json);
+  if (sarif !== null) reports.push(sarif);
+  if (json !== null && sarif !== null && json.repositoryPath === sarif.repositoryPath) {
+    fail('json-report-path and sarif-report-path must be different files.');
+  }
+
   const baseline = resolveBaseline(pr, git, io);
   if (!git.fileExistsAt(baseline.sha, spec.repositoryPath)) {
     fail(`"${spec.repositoryPath}" does not exist at the ${baseline.description}, so there is no baseline to `
@@ -395,6 +459,26 @@ async function execute(env: ActionEnvironment): Promise<ActionOutcome> {
   if (noticeCount > 0) {
     io.warning(`${noticeCount} place${noticeCount === 1 ? '' : 's'} could not be evaluated and need a manual review. `
       + 'See the job summary; a clean result is not a guarantee of compatibility there.');
+  }
+
+  if (reports.length > 0) {
+    // File-level physical locations are only truthful when the head specification
+    // is one file; with referenced files a finding may live in any of them.
+    const context: ReportContext = {
+      baseline: { path: spec.repositoryPath, revision: baseline.sha },
+      head: { path: spec.repositoryPath, revision: baseline.head },
+      physicalLocationUri: Object.prototype.hasOwnProperty.call(headSpec, EXTERNAL_FILES_KEY) ? null : spec.repositoryPath,
+    };
+    for (const destination of reports) {
+      try {
+        files.writeFile(root, destination.repositoryPath, renderReport(destination.format, result, context));
+      } catch (error) {
+        fail(`Could not write the ${destination.format.toUpperCase()} report to "${destination.repositoryPath}": ${describe(error)}`);
+      }
+      // Echoed as the caller wrote it, so it is valid in a later step of the same job.
+      io.setOutput(`${destination.format}-report-path`, destination.input);
+      io.info(`Wrote the ${destination.format.toUpperCase()} report to ${destination.input}.`);
+    }
   }
 
   const comment = await syncComment(env, report);

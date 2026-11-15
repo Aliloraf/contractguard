@@ -56,6 +56,7 @@ npm run cli -- --base examples/before.yaml --head examples/after.yaml
 | **Catches** | removed operations, parameters, success responses and media types; newly required parameters, bodies and fields; request enums narrowed; response enums widened; numeric, length and item-count ranges tightened for requests or relaxed for responses; objects closed to extra properties; response fields removed or made optional; type changes, directionally, with `integer` understood as part of `number`; response headers removed, made optional or changed in type, constraints or serialisation; the same body and header rules on documented error, range and `default` responses; authentication made mandatory, extra security schemes or OAuth2/OpenID Connect scopes required, and accepted authentication alternatives removed |
 | **Understands** | OpenAPI 3.0 and 3.1, YAML and JSON, internal and local multi-file `$ref` (including recursion, see [Multi-file specifications](#multi-file-specifications)), nested objects and arrays, `allOf` wherever it can be merged without changing meaning, and response status keys the way OpenAPI resolves them: an explicit code, then its `nXX` range, then `default`, and `security` as an access rule: document defaults, operation overrides, `security: []`, optional authentication, alternatives (OR) and combined schemes (AND) |
 | **Reports for review instead of guessing** | `anyOf`/`oneOf` changes whose effect depends on overlapping alternatives, `allOf` that cannot be merged safely, `pattern`, `format`, `multipleOf` and other constraints needing instance-level reasoning, `security` changes that hinge on a renamed, redefined or undefined scheme, and documented statuses that were added, removed or moved between an explicit code, a range and `default` |
+| **Reports** | Markdown (default), [JSON](#json-report) and [SARIF 2.1.0](#sarif-210-report), from the CLI and the Action, with [Code Scanning upload](#uploading-sarif-to-github-code-scanning) documented |
 | **Does not check** | remote (`http`/`https`) `$ref`, response `links`, media type ranges, `servers`, `webhooks`, `callbacks`, or anything else in [the limitations](#what-the-engine-does-not-support) |
 
 A clean report is not a proof of compatibility. Everything the engine cannot evaluate is
@@ -590,7 +591,8 @@ Available scripts:
 ## CLI usage
 
 ```bash
-npm run cli -- --base <old-spec> --head <new-spec> [--base-root <dir>] [--head-root <dir>] [--report <file.md>]
+npm run cli -- --base <old-spec> --head <new-spec> [--format markdown|json|sarif] [--output <file>]
+               [--base-root <dir>] [--head-root <dir>] [--report <file.md>]
 ```
 
 Example, using the specs committed under `examples/`:
@@ -607,7 +609,13 @@ Flags:
   live in, for the base and head document respectively. It defaults to the document's own
   directory, so `$ref: ../shared/User.yaml` needs a root that contains `shared/`. Nothing
   outside the root is read.
-- `--report` *(optional)* — also write the Markdown report to this file.
+- `--format` *(optional)* — `markdown` (the default), `json` or `sarif`. See
+  [Reports: Markdown, JSON and SARIF](#reports-markdown-json-and-sarif).
+- `--output` *(optional)* — write the selected format to this file instead of stdout. The
+  directory must exist, the path must not be a directory, and it must not be one of the two
+  compared specifications.
+- `--report` *(optional)* — also write the **Markdown** report to this file, whatever `--format`
+  says. Kept for compatibility; prefer `--format markdown --output`.
 
 Documents that reference other local files are followed automatically; see
 [Multi-file specifications](#multi-file-specifications). Two checkouts or two directories work
@@ -625,7 +633,11 @@ The report is printed to stdout. Exit codes:
 | --- | --- |
 | `0` | No breaking changes found by the current rule set (review-required notices do not change this). |
 | `1` | At least one potentially breaking change found. |
-| `2` | Invalid usage, unreadable file, or an unsupported/invalid specification. |
+| `2` | Invalid usage (including an unknown `--format` or an unusable `--output`), unreadable file, or an unsupported/invalid specification. |
+
+The exit code depends only on the comparison, never on the format or on whether the report goes
+to a file. With `--format json` or `--format sarif`, stdout carries the report and nothing else;
+usage errors and diagnostics go to stderr, and a failed run prints nothing to stdout.
 
 To compare two git revisions by hand, check the base out beside the working tree so its
 referenced files come with it (a single `git show` would leave them behind):
@@ -636,6 +648,171 @@ npm run cli -- --base ../base-checkout/openapi.yaml --head openapi.yaml
 ```
 
 ---
+
+## Reports: Markdown, JSON and SARIF
+
+The same findings can be rendered three ways. Formatting is separate from the comparison: the
+JSON and SARIF reports contain exactly the findings the Markdown report lists, with the same rule
+codes, locations and messages, in a fixed order, and the output is byte-for-byte reproducible
+(no timestamps, no machine-specific paths, no locale-dependent sorting).
+
+```bash
+# Markdown is the default and is unchanged.
+npm run -s cli -- --base old.yaml --head new.yaml
+
+# JSON or SARIF on stdout, ready to pipe (-s keeps npm's own banner out of stdout):
+npm run -s cli -- --base old.yaml --head new.yaml --format json  | jq '.summary'
+npm run -s cli -- --base old.yaml --head new.yaml --format sarif > contractguard.sarif
+
+# Or write to a file; stdout stays empty and the exit code is the same:
+npm run -s cli -- --base old.yaml --head new.yaml --format sarif --output contractguard.sarif
+echo $?   # 0 compatible, 1 breaking, 2 operational error
+```
+
+### JSON report
+
+`--format json` (Action: `json-report-path`) prints one JSON document. Its shape is described by
+[`schema/report-1.0.schema.json`](schema/report-1.0.schema.json), and `schemaVersion` changes only
+when a field is removed or changes meaning; new fields can be added without a bump.
+
+```json
+{
+  "schemaVersion": "1.0",
+  "tool": { "name": "ContractGuard", "version": "0.1.0", "informationUri": "https://github.com/Aliloraf/contractguard" },
+  "comparison": {
+    "baseline": { "path": "openapi.yaml", "revision": "3d4fc74…" },
+    "head": { "path": "openapi.yaml", "revision": "00cd35d…" }
+  },
+  "summary": { "status": "breaking", "breaking": 1, "notices": 1, "checkedOperations": 3 },
+  "breaking": [
+    {
+      "code": "RESPONSE_FIELD_REMOVED",
+      "severity": "error",
+      "location": "GET /users 200 response [application/json].name",
+      "message": "Response field removed."
+    }
+  ],
+  "notices": [
+    {
+      "code": "CONSTRAINT_NOT_COMPARED",
+      "severity": "warning",
+      "location": "GET /users 200 response [application/json].id",
+      "message": "…"
+    }
+  ],
+  "rules": [
+    {
+      "code": "CONSTRAINT_NOT_COMPARED",
+      "kind": "notice",
+      "severity": "warning",
+      "title": "Validation constraint not compared",
+      "description": "…"
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `summary.status` | `"breaking"` when `breaking` is not empty, otherwise `"compatible"`. Notices never make it `"breaking"`, matching the exit code. |
+| `breaking[]`, `notices[]` | The two lists the comparison produces, ordered by `location`, then `code`, then `message` (code-point order). |
+| `severity` | `"error"` for a breaking finding, `"warning"` for a review-required notice. |
+| `code` | The stable [rule code](#what-the-comparison-engine-detects). Codes are not renamed within a major version. |
+| `location` | The logical location: operation, status, media type and schema path, such as `GET /orders 200 response [application/json].items[].price`. |
+| `comparison` | Where each side came from. `revision` is a Git commit in the Action and `null` in the CLI; a side the caller cannot describe is `null`, never guessed. |
+| `rules` | Description of each rule that fired, ordered by code. |
+
+### SARIF 2.1.0 report
+
+`--format sarif` (Action: `sarif-report-path`) prints a SARIF 2.1.0 log with `$schema` set to the
+OASIS 2.1.0 schema. The test suite validates it against that official schema.
+
+- **Tool and rules.** `tool.driver` names ContractGuard and its version. `driver.rules` lists every
+  rule code in code order, with `shortDescription`, `fullDescription`, `help`, a `helpUri` into this
+  README and `defaultConfiguration.level`. The list, and so every `ruleIndex`, does not depend on
+  which findings a run produced.
+- **Results and levels.** Every breaking finding is a result at level `error` and every notice a
+  result at level `warning`; `properties.kind` says `breaking` or `notice`. A compatible
+  comparison has an empty `results` array. `invocations[0].executionSuccessful` stays `true`:
+  finding a breaking change is a result, not a tool failure.
+- **Locations are logical.** ContractGuard compares documents semantically and has no line or
+  column for a finding, so each result carries a `logicalLocations` entry (`fullyQualifiedName` is
+  the location above), and **no `region`, line or column is ever emitted**. The message text starts
+  with the location, for consumers that do not show logical locations.
+- **File-level physical location, only when it is true.** In the GitHub Action, when the head
+  specification is a single file, each result also gets a `physicalLocation` that names that file
+  and nothing more. With referenced files (`$ref` to other files) a finding may live in any of
+  them, so those results stay logical-only. The CLI never adds one, because it does not know a
+  repository root. GitHub Code Scanning only displays results that have a physical location, so
+  for multi-file specifications use the JSON report, the job summary or the pull request comment
+  alongside SARIF.
+- **Stable identity.** `partialFingerprints["contractguard/v1"]` is a SHA-256 of the rule code,
+  location and message, so the same finding is recognised from run to run.
+
+### Uploading SARIF to GitHub Code Scanning
+
+The Action writes the file; it never uploads anything and needs no token beyond `contents: read`.
+Upload is a separate step using GitHub's own action, and that step needs `security-events: write`.
+
+```yaml
+name: API compatibility
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  compatibility:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write      # only for the upload-sarif step
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: contractguard
+        uses: Aliloraf/contractguard@v0.1.0
+        with:
+          spec-path: openapi.yaml
+          sarif-report-path: contractguard.sarif
+          json-report-path: contractguard.json
+      # The step above fails when it finds a breaking change, so run the upload anyway,
+      # but only when a report was produced (an operational error produces none).
+      - uses: github/codeql-action/upload-sarif@v4
+        if: ${{ !cancelled() && steps.contractguard.outputs.sarif-report-path != '' }}
+        with:
+          sarif_file: contractguard.sarif
+          category: contractguard
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.contractguard.outputs.json-report-path != '' }}
+        with:
+          name: contractguard-report
+          path: contractguard.json
+```
+
+Prerequisites and caveats:
+
+- **Code Scanning must be available.** It is free for public repositories; a private repository
+  needs GitHub Code Security. Without it the upload step fails (the ContractGuard step itself is
+  unaffected).
+- **`security-events: write` is required for upload**, and GitHub does not grant it to workflows
+  triggered by pull requests **from forks**. Skip the upload there:
+  `if: github.event.pull_request.head.repo.full_name == github.repository`. The report file and the
+  job summary are still produced.
+- **Never use `pull_request_target`** to get that permission; ContractGuard refuses to run on it.
+- Results appear as alerts on the pull request only when they carry a physical location (see
+  above). Because the alert text is the finding's own message, they are most useful on
+  single-file specifications.
+- Keep `category` unique per specification if several are checked in one workflow.
+
+### Report file safety in the Action
+
+`json-report-path` and `sarif-report-path` are validated before anything is compared: the path must
+be relative, inside the checkout, outside `.git`, must name a file, and must not be the
+specification or each other. When written, every directory on the path and the file itself are
+inspected without following links; a symbolic link anywhere on the path, or an existing directory
+or special file at the target, is refused, so a link planted in a pull request cannot redirect the
+write outside the repository. Missing directories are created. A report that cannot be written
+fails the step with an explained error.
 
 ## GitHub Action
 
@@ -716,6 +893,8 @@ what changed. For maximum strictness, pin the commit SHA a tag points at.
 | `spec-path` | yes | — | Repository-relative path to the OpenAPI 3.0/3.1 YAML or JSON document. Absolute paths, paths outside the checkout, and paths containing NUL are rejected. Paths with spaces or shell metacharacters are safe: Git is invoked with an explicit argument list and no shell. |
 | `comment` | no | `false` | Post or update a sticky pull request comment with the report. Must be `true` or `false`. |
 | `github-token` | no | — | Token for the optional comment. Required when `comment` is `true`; without it the comment is skipped with a warning. |
+| `json-report-path` | no | — | Write the [JSON report](#json-report) to this repository-relative file. Nothing is written when empty. |
+| `sarif-report-path` | no | — | Write the [SARIF 2.1.0 report](#sarif-210-report) to this repository-relative file. Nothing is written when empty. Never uploads; see [Uploading SARIF](#uploading-sarif-to-github-code-scanning). |
 
 ### Outputs
 
@@ -724,6 +903,8 @@ what changed. For maximum strictness, pin the commit SHA a tag points at.
 | `breaking` | `"true"` / `"false"` — whether any breaking change was detected. |
 | `breaking-count` | Number of detected breaking changes. |
 | `notice-count` | Number of places that could not be evaluated and need a manual review. Never fails the check on its own. |
+| `json-report-path` | The path the JSON report was written to, as given. Set only when `json-report-path` was. |
+| `sarif-report-path` | The path the SARIF report was written to, as given. Set only when `sarif-report-path` was. |
 
 ### Results
 
@@ -735,8 +916,9 @@ what changed. For maximum strictness, pin the commit SHA a tag points at.
 | Breaking changes and notices | **fails** | Both, in the same report |
 | Specification missing at the base commit, missing from the checkout, invalid, or unreadable | **fails** | An explained error. A failure is never reported as compatible |
 
-The report is always written to the job summary; a job summary that cannot be written
-degrades to a warning rather than losing the result.
+The Markdown report is always written to the job summary, and the JSON and SARIF files are
+written, when requested, whether or not breaking changes were found. A job summary that cannot be
+written degrades to a warning rather than losing the result.
 
 ### Example workflow
 
@@ -864,6 +1046,8 @@ end-to-end behaviour on GitHub is worth confirming once per release:
 - **No baseline fallback.** If the common ancestor of the base commit and HEAD cannot be
   found, the step fails with guidance rather than measuring against another commit, because a
   silently substituted baseline can turn a breaking change into a pass.
+- Report files are opt-in, validated before the comparison and written without following
+  symbolic links; see [Report file safety](#report-file-safety-in-the-action).
 - Commenting is opt-in, needs an explicitly passed token, and every failure to comment is a
   warning — it can never conceal or alter the compatibility result.
 

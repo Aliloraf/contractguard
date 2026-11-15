@@ -19,6 +19,19 @@ inputs:
   github-token:
     description: GITHUB_TOKEN (or a PAT) used for the optional pull request comment.
     required: false
+  json-report-path:
+    description: >-
+      Optional repository-relative file to write the machine-readable JSON report
+      to, for example to attach it with actions/upload-artifact. The path must be
+      inside the checkout, must not contain symbolic links and must not be the
+      specification itself. Missing directories are created.
+    required: false
+  sarif-report-path:
+    description: >-
+      Optional repository-relative file to write a SARIF 2.1.0 report to, for
+      example to upload it with github/codeql-action/upload-sarif. The same path
+      rules as json-report-path apply. The Action itself never uploads anything.
+    required: false
 outputs:
   breaking:
     description: '"true" when at least one breaking change was detected.'
@@ -28,6 +41,10 @@ outputs:
     description: >-
       Number of places that could not be evaluated and need a manual review.
       These never fail the check on their own.
+  json-report-path:
+    description: The repository-relative path the JSON report was written to; only set when json-report-path was given.
+  sarif-report-path:
+    description: The repository-relative path the SARIF report was written to; only set when sarif-report-path was given.
 runs:
   using: node24
   main: dist/index.js
